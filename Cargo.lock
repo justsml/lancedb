@@ -4808,8 +4808,12 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "axum 0.8.8",
+ "bytes",
+ "chrono",
  "futures",
+ "getrandom 0.3.4",
  "http 1.4.0",
+ "js-sys",
  "lance",
  "lance-core",
  "lance-index",
@@ -4825,6 +4829,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

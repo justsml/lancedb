@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use http::header::HeaderName;
 use lance::dataset::ReadParams;
 use lance::session::Session;
 use lance_index::scalar::FullTextSearchQuery;
@@ -23,16 +22,24 @@ use lancedb::ipc::{batches_to_ipc_file, schema_to_ipc_file};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::{BaseTable, NativeTable};
 use lancedb::{Error, Result, Table};
-use object_store::http::HttpBuilder;
 use object_store::path::Path;
 use object_store::{
-    DynObjectStore, GetOptions, GetResult, HeaderMap, HeaderValue, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult,
+    DynObjectStore, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+#[cfg(not(target_arch = "wasm32"))]
+use http::header::HeaderName;
+#[cfg(not(target_arch = "wasm32"))]
+use object_store::http::HttpBuilder;
+#[cfg(not(target_arch = "wasm32"))]
+use object_store::{HeaderMap, HeaderValue};
+#[cfg(target_arch = "wasm32")]
+mod fetch_object_store;
+#[cfg(target_arch = "wasm32")]
+use fetch_object_store::FetchHttpStore;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -40,6 +47,9 @@ use wasm_bindgen::prelude::*;
 // For generic static HTTP hosting we instead resolve through a deterministic
 // copy of the latest manifest at this path.
 const MANIFEST_PATH: &str = "_latest.manifest";
+const LATEST_VERSION_PATH: &str = "_latest.version";
+const WEB_METADATA_PATH: &str = "_web.json";
+const SNAPSHOT_PATH: &str = "_snapshot.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +59,9 @@ pub struct OpenTableOptions {
     pub cache_bytes: Option<usize>,
     pub max_concurrent_ranges: Option<usize>,
     pub manifest_url: Option<String>,
+    pub latest_version_url: Option<String>,
+    pub web_metadata_url: Option<String>,
+    pub snapshot_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,11 +96,58 @@ pub enum SelectRequest {
     Dynamic(BTreeMap<String, String>),
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishedTableMetadata {
+    version: u64,
+    manifest_path: String,
+    manifest_size_bytes: Option<u64>,
+    manifest_naming_scheme: String,
+    latest_manifest_path: String,
+    latest_version_path: String,
+    web_metadata_path: String,
+    snapshot_path: String,
+    default_vector_column: Option<String>,
+    #[serde(default)]
+    vector_columns: Vec<String>,
+    #[serde(default)]
+    fts_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishedSnapshot {
+    version: u64,
+    manifest_path: String,
+    manifest_size_bytes: Option<u64>,
+    manifest_naming_scheme: String,
+    latest_manifest_path: String,
+    latest_version_path: String,
+    web_metadata_path: String,
+    snapshot_path: String,
+    default_vector_column: Option<String>,
+    #[serde(default)]
+    vector_columns: Vec<String>,
+    #[serde(default)]
+    fts_columns: Vec<String>,
+    is_complete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPublishedState {
+    current_version: Option<u64>,
+    latest_version_url: String,
+    manifest_url: String,
+    snapshot: Option<PublishedSnapshot>,
+    table_metadata: Option<PublishedTableMetadata>,
+}
+
 #[derive(Clone)]
 pub struct RemoteSearchTable {
     table_url: String,
     table_name: String,
     options: OpenTableOptions,
+    published: ResolvedPublishedState,
     session: Arc<Session>,
     table: Option<Table>,
 }
@@ -96,14 +156,22 @@ impl RemoteSearchTable {
     pub async fn open(table_url: &str, options: OpenTableOptions) -> Result<Self> {
         let table_url = normalize_table_url(table_url)?;
         let table_name = table_name_from_url(&table_url)?;
+        let published = resolve_published_state(&table_url, &options).await?;
         let session = Arc::new(session_from_cache_bytes(options.cache_bytes));
-        let table =
-            open_table_with_options(&table_url, &table_name, &options, session.clone()).await?;
+        let table = open_table_with_options(
+            &table_url,
+            &table_name,
+            &options,
+            &published,
+            session.clone(),
+        )
+        .await?;
 
         Ok(Self {
             table_url,
             table_name,
             options,
+            published,
             session,
             table: Some(table),
         })
@@ -117,6 +185,7 @@ impl RemoteSearchTable {
 
     pub async fn search(&self, request: SearchRequest) -> Result<Vec<u8>> {
         let table = self.table_ref()?;
+        let request = apply_published_request_defaults(request, &self.published)?;
         match (request.vector.clone(), request.text.clone()) {
             (Some(vector), text) => {
                 let mut query = table.query().nearest_to(vector)?;
@@ -149,16 +218,29 @@ impl RemoteSearchTable {
     }
 
     pub async fn refresh(&mut self) -> Result<bool> {
+        if let (Some(current_version), latest_version_url) = (
+            self.published.current_version,
+            self.published.latest_version_url.as_str(),
+        ) {
+            let latest_version = fetch_latest_version(latest_version_url, &self.options).await?;
+            if latest_version == current_version {
+                return Ok(false);
+            }
+        }
+
         let current_version = self.table_ref()?.version().await?;
+        let published = resolve_published_state(&self.table_url, &self.options).await?;
         let reopened = open_table_with_options(
             &self.table_url,
             &self.table_name,
             &self.options,
+            &published,
             self.session.clone(),
         )
         .await?;
         let next_version = reopened.version().await?;
         self.table = Some(reopened);
+        self.published = published;
         Ok(next_version != current_version)
     }
 
@@ -216,6 +298,177 @@ fn table_name_from_url(table_url: &str) -> Result<String> {
     Ok(table_name.to_string())
 }
 
+async fn resolve_published_state(
+    table_url: &str,
+    options: &OpenTableOptions,
+) -> Result<ResolvedPublishedState> {
+    let table_url = Url::parse(table_url).map_err(|source| Error::InvalidInput {
+        message: format!("invalid table URL '{table_url}': {source}"),
+    })?;
+    let web_metadata_url = options
+        .web_metadata_url
+        .clone()
+        .unwrap_or_else(|| resolve_url(&table_url, WEB_METADATA_PATH));
+    let table_metadata =
+        fetch_optional_json::<PublishedTableMetadata>(&web_metadata_url, &options.headers).await?;
+
+    let snapshot_url = options.snapshot_url.clone().unwrap_or_else(|| {
+        resolve_url(
+            &table_url,
+            table_metadata
+                .as_ref()
+                .map(|metadata| metadata.snapshot_path.as_str())
+                .unwrap_or(SNAPSHOT_PATH),
+        )
+    });
+    let snapshot =
+        fetch_optional_json::<PublishedSnapshot>(&snapshot_url, &options.headers).await?;
+
+    Ok(ResolvedPublishedState {
+        current_version: table_metadata
+            .as_ref()
+            .map(|metadata| metadata.version)
+            .or_else(|| snapshot.as_ref().map(|snapshot| snapshot.version)),
+        latest_version_url: options.latest_version_url.clone().unwrap_or_else(|| {
+            resolve_url(
+                &table_url,
+                table_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.latest_version_path.as_str())
+                    .or_else(|| {
+                        snapshot.as_ref().map(|published_snapshot| {
+                            published_snapshot.latest_version_path.as_str()
+                        })
+                    })
+                    .unwrap_or(LATEST_VERSION_PATH),
+            )
+        }),
+        manifest_url: options.manifest_url.clone().unwrap_or_else(|| {
+            resolve_url(
+                &table_url,
+                table_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.latest_manifest_path.as_str())
+                    .or_else(|| {
+                        snapshot.as_ref().map(|published_snapshot| {
+                            published_snapshot.latest_manifest_path.as_str()
+                        })
+                    })
+                    .unwrap_or(MANIFEST_PATH),
+            )
+        }),
+        snapshot,
+        table_metadata,
+    })
+}
+
+async fn fetch_optional_json<T>(url: &str, headers: &HashMap<String, String>) -> Result<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let bytes = match fetch_optional_bytes(url, headers).await? {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
+    let parsed = serde_json::from_slice::<T>(&bytes).map_err(|source| Error::InvalidInput {
+        message: format!("invalid published metadata at '{url}': {source}"),
+    })?;
+    Ok(Some(parsed))
+}
+
+async fn fetch_optional_bytes(
+    url: &str,
+    headers: &HashMap<String, String>,
+) -> Result<Option<Vec<u8>>> {
+    let url = Url::parse(url).map_err(|source| Error::InvalidInput {
+        message: format!("invalid sidecar URL '{url}': {source}"),
+    })?;
+    let store = build_store(&url, headers)?;
+    match store.get(&Path::default()).await {
+        Ok(result) => Ok(Some(result.bytes().await?.to_vec())),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(source) => Err(source.into()),
+    }
+}
+
+async fn fetch_latest_version(url: &str, options: &OpenTableOptions) -> Result<u64> {
+    let bytes = fetch_optional_bytes(url, &options.headers)
+        .await?
+        .ok_or_else(|| Error::Runtime {
+            message: format!("latest version sidecar '{url}' was not found"),
+        })?;
+    let raw = String::from_utf8(bytes).map_err(|source| Error::InvalidInput {
+        message: format!("latest version sidecar '{url}' is not valid UTF-8: {source}"),
+    })?;
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|source| Error::InvalidInput {
+            message: format!(
+                "latest version sidecar '{url}' contained an invalid version: {source}"
+            ),
+        })
+}
+
+fn resolve_url(base_url: &Url, path_or_url: &str) -> String {
+    Url::parse(path_or_url)
+        .or_else(|_| base_url.join(path_or_url))
+        .expect("joining published sidecar URL should succeed")
+        .to_string()
+}
+
+fn apply_published_request_defaults(
+    mut request: SearchRequest,
+    published: &ResolvedPublishedState,
+) -> Result<SearchRequest> {
+    let published_metadata = published
+        .table_metadata
+        .as_ref()
+        .map(PublishedMetadataView::Table)
+        .or_else(|| {
+            published
+                .snapshot
+                .as_ref()
+                .map(PublishedMetadataView::Snapshot)
+        });
+
+    if request.text.is_some()
+        && published_metadata.is_some_and(|metadata| metadata.fts_columns().is_empty())
+    {
+        return Err(Error::InvalidInput {
+            message: "this table does not advertise any full-text search indexed columns in its published metadata".to_string(),
+        });
+    }
+
+    if request.vector.is_some() && request.vector_column.is_none() {
+        request.vector_column = published_metadata
+            .and_then(|metadata| metadata.default_vector_column().map(ToOwned::to_owned));
+    }
+
+    Ok(request)
+}
+
+#[derive(Clone, Copy)]
+enum PublishedMetadataView<'a> {
+    Table(&'a PublishedTableMetadata),
+    Snapshot(&'a PublishedSnapshot),
+}
+
+impl PublishedMetadataView<'_> {
+    fn default_vector_column(&self) -> Option<&str> {
+        match self {
+            Self::Table(metadata) => metadata.default_vector_column.as_deref(),
+            Self::Snapshot(snapshot) => snapshot.default_vector_column.as_deref(),
+        }
+    }
+
+    fn fts_columns(&self) -> &[String] {
+        match self {
+            Self::Table(metadata) => metadata.fts_columns.as_slice(),
+            Self::Snapshot(snapshot) => snapshot.fts_columns.as_slice(),
+        }
+    }
+}
+
 fn session_from_cache_bytes(cache_bytes: Option<usize>) -> Session {
     match cache_bytes {
         Some(cache_bytes) => {
@@ -231,6 +484,7 @@ async fn open_table_with_options(
     table_url: &str,
     table_name: &str,
     options: &OpenTableOptions,
+    published: &ResolvedPublishedState,
     session: Arc<Session>,
 ) -> Result<Table> {
     let parsed_url = Url::parse(table_url).map_err(|source| Error::InvalidInput {
@@ -238,7 +492,8 @@ async fn open_table_with_options(
     })?;
     let table_path = object_store_table_path(&parsed_url)?;
 
-    let (http_store, wrapper) = build_open_store(&parsed_url, &table_path, options)?;
+    let (http_store, wrapper) =
+        build_open_store(&parsed_url, &table_path, &published.manifest_url, options)?;
     let preflight_store = wrapper
         .as_ref()
         .map(|wrapper| wrapper.wrap("lancedb-wasm-preflight", http_store.clone()))
@@ -275,21 +530,23 @@ async fn open_table_with_options(
 fn build_open_store(
     table_url: &Url,
     table_path: &Path,
+    manifest_url: &str,
     options: &OpenTableOptions,
 ) -> Result<(Arc<DynObjectStore>, Option<Arc<dyn WrappingObjectStore>>)> {
-    let http_store = Arc::new(build_http_store(
-        &object_store_root_url(table_url),
-        &options.headers,
-    )?);
+    let http_store = build_store(&object_store_root_url(table_url), &options.headers)?;
 
     let wrapper = options
         .manifest_url
         .as_deref()
-        .map(|manifest_url| {
+        .or(Some(manifest_url))
+        .filter(|resolved_manifest_url| {
+            *resolved_manifest_url != resolve_url(table_url, MANIFEST_PATH).as_str()
+        })
+        .map(|resolved_manifest_url| {
             build_manifest_wrapper(
                 table_url,
                 table_path.child(MANIFEST_PATH),
-                manifest_url,
+                resolved_manifest_url,
                 &options.headers,
             )
         })
@@ -299,6 +556,19 @@ fn build_open_store(
     Ok((http_store as Arc<DynObjectStore>, wrapper))
 }
 
+fn build_store(url: &Url, headers: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(Arc::new(FetchHttpStore::new(url.clone(), headers.clone())) as Arc<DynObjectStore>)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Ok(Arc::new(build_http_store(url, headers)?) as Arc<DynObjectStore>)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn build_http_store(
     url: &Url,
     headers: &HashMap<String, String>,
@@ -350,7 +620,7 @@ fn build_manifest_wrapper(
         });
     }
 
-    let manifest_store = Arc::new(build_http_store(&manifest_url, headers)?);
+    let manifest_store = build_store(&manifest_url, headers)?;
     Ok(ManifestRedirectWrapper {
         table_url: table_url.to_string(),
         manifest_location,

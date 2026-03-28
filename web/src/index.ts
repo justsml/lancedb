@@ -2,7 +2,7 @@ import { Schema, Table as ArrowTable, tableFromIPC } from "apache-arrow";
 import type {
   WasmModule,
   WasmRemoteSearchHandle,
-} from "./generated/lancedb_wasm";
+} from "./generated/lancedb_wasm.js";
 
 export interface OpenTableOptions {
   fetch?: typeof globalThis.fetch;
@@ -42,17 +42,59 @@ export interface RemoteSearchTable {
 
 type OpenOptionsPayload = Omit<OpenTableOptions, "fetch" | "headers"> & {
   headers?: Record<string, string>;
+  latestVersionUrl?: string;
+  snapshotUrl?: string;
+  webMetadataUrl?: string;
 };
 
+interface PublishedTableMetadata {
+  version: number;
+  manifestPath: string;
+  manifestSizeBytes?: number;
+  manifestNamingScheme: string;
+  latestManifestPath: string;
+  latestVersionPath: string;
+  webMetadataPath: string;
+  snapshotPath: string;
+  defaultVectorColumn?: string;
+  vectorColumns: string[];
+  ftsColumns: string[];
+}
+
+interface PublishedSnapshot {
+  version: number;
+  manifestPath: string;
+  manifestSizeBytes?: number;
+  manifestNamingScheme: string;
+  latestManifestPath: string;
+  latestVersionPath: string;
+  webMetadataPath: string;
+  snapshotPath: string;
+  defaultVectorColumn?: string;
+  vectorColumns: string[];
+  ftsColumns: string[];
+  isComplete: boolean;
+}
+
+interface ResolvedPublishedState {
+  currentVersion: number | null;
+  latestVersionUrl: string;
+  manifestUrl: string;
+  snapshot: PublishedSnapshot | null;
+  snapshotUrl: string;
+  tableMetadata: PublishedTableMetadata | null;
+  webMetadataUrl: string;
+}
+
 let wasmModuleLoader: () => Promise<WasmModule> = async () =>
-  (await import("./generated/lancedb_wasm")) as WasmModule;
+  (await import("./generated/lancedb_wasm.js")) as WasmModule;
 
 export function __setWasmModuleLoaderForTests(
   loader?: () => Promise<WasmModule>,
 ): void {
   wasmModuleLoader =
     loader ??
-    (async () => (await import("./generated/lancedb_wasm")) as WasmModule);
+    (async () => (await import("./generated/lancedb_wasm.js")) as WasmModule);
 }
 
 export async function openTable(
@@ -67,6 +109,7 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
   #options: OpenTableOptions;
   #headersSignature: string;
   #handle: WasmRemoteSearchHandle | null;
+  #published: ResolvedPublishedState;
   #wasmModule: WasmModule;
 
   private constructor(
@@ -74,12 +117,14 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
     options: OpenTableOptions,
     headersSignature: string,
     handle: WasmRemoteSearchHandle,
+    published: ResolvedPublishedState,
     wasmModule: WasmModule,
   ) {
     this.#tableUrl = tableUrl;
     this.#options = options;
     this.#headersSignature = headersSignature;
     this.#handle = handle;
+    this.#published = published;
     this.#wasmModule = wasmModule;
   }
 
@@ -89,11 +134,16 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
   ): Promise<RemoteSearchTableImpl> {
     const normalizedTableUrl = normalizeHttpUrl(tableUrl, "table");
     const headers = await resolveHeaders(options.headers);
-    await preflightOpen(normalizedTableUrl, headers, options);
+    const published = await resolvePublishedState(
+      normalizedTableUrl,
+      headers,
+      options,
+    );
+    await preflightOpen(published.manifestUrl, headers, options);
     const wasmModule = await wasmModuleLoader();
     const handle = await wasmModule.open_table(
       normalizedTableUrl,
-      JSON.stringify(makeOpenOptionsPayload(options, headers)),
+      JSON.stringify(makeOpenOptionsPayload(options, headers, published)),
     );
 
     return new RemoteSearchTableImpl(
@@ -101,6 +151,7 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
       options,
       stableHeaderSignature(headers),
       handle,
+      published,
       wasmModule,
     );
   }
@@ -112,15 +163,43 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
 
   async search(request: SearchRequest): Promise<ArrowTable> {
     await this.#ensureHandle();
+    const normalizedRequest = normalizeSearchRequest(request, this.#published);
     const bytes = await this.#handle!.search(
-      JSON.stringify(normalizeSearchRequest(request)),
+      JSON.stringify(normalizedRequest),
     );
     return tableFromIPC(bytes);
   }
 
   async refresh(): Promise<boolean> {
     await this.#ensureHandle();
-    return this.#handle!.refresh();
+    const fetchFn = this.#options.fetch ?? globalThis.fetch;
+    if (
+      fetchFn === undefined ||
+      this.#published.currentVersion === null ||
+      this.#published.latestVersionUrl.length === 0
+    ) {
+      const changed = await this.#handle!.refresh();
+      if (changed && fetchFn !== undefined) {
+        this.#published = await resolvePublishedState(
+          this.#tableUrl,
+          await resolveHeaders(this.#options.headers),
+          this.#options,
+        );
+      }
+      return changed;
+    }
+
+    const latestVersion = await fetchLatestVersion(
+      this.#published.latestVersionUrl,
+      await resolveHeaders(this.#options.headers),
+      this.#options,
+    );
+    if (latestVersion === this.#published.currentVersion) {
+      return false;
+    }
+
+    await this.#reopenHandle();
+    return true;
   }
 
   close(): void {
@@ -142,13 +221,31 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
       return;
     }
 
-    await preflightOpen(this.#tableUrl, headers, this.#options);
-    this.#handle.close();
+    await this.#reopenHandle(headers, nextSignature);
+  }
+
+  async #reopenHandle(
+    headers?: Record<string, string>,
+    headersSignature?: string,
+  ): Promise<void> {
+    const resolvedHeaders = headers ?? (await resolveHeaders(this.#options.headers));
+    const nextSignature =
+      headersSignature ?? stableHeaderSignature(resolvedHeaders);
+    const published = await resolvePublishedState(
+      this.#tableUrl,
+      resolvedHeaders,
+      this.#options,
+    );
+    await preflightOpen(published.manifestUrl, resolvedHeaders, this.#options);
+    this.#handle!.close();
     this.#handle = await this.#wasmModule.open_table(
       this.#tableUrl,
-      JSON.stringify(makeOpenOptionsPayload(this.#options, headers)),
+      JSON.stringify(
+        makeOpenOptionsPayload(this.#options, resolvedHeaders, published),
+      ),
     );
     this.#headersSignature = nextSignature;
+    this.#published = published;
   }
 }
 
@@ -192,17 +289,21 @@ function stableHeaderSignature(headers: Record<string, string>): string {
 function makeOpenOptionsPayload(
   options: OpenTableOptions,
   headers: Record<string, string>,
+  published: ResolvedPublishedState,
 ): OpenOptionsPayload {
   return {
     headers,
     cacheBytes: options.cacheBytes,
     maxConcurrentRanges: options.maxConcurrentRanges,
-    manifestUrl: options.manifestUrl,
+    manifestUrl: published.manifestUrl,
+    latestVersionUrl: published.latestVersionUrl,
+    snapshotUrl: published.snapshotUrl,
+    webMetadataUrl: published.webMetadataUrl,
   };
 }
 
 async function preflightOpen(
-  tableUrl: string,
+  manifestUrl: string,
   headers: Record<string, string>,
   options: OpenTableOptions,
 ): Promise<void> {
@@ -213,8 +314,6 @@ async function preflightOpen(
     );
   }
 
-  const manifestUrl =
-    options.manifestUrl ?? new URL("_latest.manifest", tableUrl).toString();
   const response = await fetchFn(manifestUrl, {
     method: "GET",
     headers: {
@@ -237,9 +336,139 @@ async function preflightOpen(
   }
 }
 
-function normalizeSearchRequest(request: SearchRequest): Record<string, unknown> {
+async function resolvePublishedState(
+  tableUrl: string,
+  headers: Record<string, string>,
+  options: OpenTableOptions,
+): Promise<ResolvedPublishedState> {
+  const webMetadataUrl = resolvePublishedUrl(tableUrl, "_web.json");
+  const tableMetadata = await fetchJsonIfExists<PublishedTableMetadata>(
+    webMetadataUrl,
+    headers,
+    options,
+  );
+
+  const snapshotUrl = resolvePublishedUrl(
+    tableUrl,
+    tableMetadata?.snapshotPath ?? "_snapshot.json",
+  );
+  const snapshot = await fetchJsonIfExists<PublishedSnapshot>(
+    snapshotUrl,
+    headers,
+    options,
+  );
+
+  return {
+    currentVersion: tableMetadata?.version ?? snapshot?.version ?? null,
+    latestVersionUrl: resolvePublishedUrl(
+      tableUrl,
+      tableMetadata?.latestVersionPath ?? snapshot?.latestVersionPath ?? "_latest.version",
+    ),
+    manifestUrl:
+      options.manifestUrl ??
+      resolvePublishedUrl(
+        tableUrl,
+        tableMetadata?.latestManifestPath ??
+          snapshot?.latestManifestPath ??
+          "_latest.manifest",
+      ),
+    snapshot,
+    snapshotUrl,
+    tableMetadata,
+    webMetadataUrl,
+  };
+}
+
+async function fetchJsonIfExists<T>(
+  url: string,
+  headers: Record<string, string>,
+  options: OpenTableOptions,
+): Promise<T | null> {
+  const fetchFn = options.fetch ?? globalThis.fetch;
+  if (fetchFn === undefined) {
+    return null;
+  }
+
+  const response = await fetchFn(url, {
+    method: "GET",
+    headers,
+  });
+
+  if (response.status === 404) {
+    return null;
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch published table metadata from ${url}. Received status ${response.status}.`,
+    );
+  }
+
+  try {
+    return (await response.json()) as T;
+  } catch (error) {
+    throw new Error(
+      `Failed to parse published table metadata from ${url}: ${(error as Error).message}`,
+    );
+  }
+}
+
+async function fetchLatestVersion(
+  latestVersionUrl: string,
+  headers: Record<string, string>,
+  options: OpenTableOptions,
+): Promise<number> {
+  const fetchFn = options.fetch ?? globalThis.fetch;
+  if (fetchFn === undefined) {
+    throw new Error("No fetch implementation is available for refresh.");
+  }
+
+  const response = await fetchFn(latestVersionUrl, {
+    method: "GET",
+    headers,
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch latest table version from ${latestVersionUrl}. Received status ${response.status}.`,
+    );
+  }
+
+  const rawVersion = (await response.text()).trim();
+  const version = Number.parseInt(rawVersion, 10);
+  if (!Number.isFinite(version)) {
+    throw new Error(
+      `Invalid latest table version "${rawVersion}" returned from ${latestVersionUrl}.`,
+    );
+  }
+  return version;
+}
+
+function resolvePublishedUrl(tableUrl: string, pathOrUrl: string): string {
+  try {
+    return new URL(pathOrUrl).toString();
+  } catch {
+    return new URL(pathOrUrl, tableUrl).toString();
+  }
+}
+
+function normalizeSearchRequest(
+  request: SearchRequest,
+  published: ResolvedPublishedState,
+): Record<string, unknown> {
+  const metadata = published.tableMetadata ?? published.snapshot;
+  if (request.text !== undefined && metadata !== null && metadata.ftsColumns.length === 0) {
+    throw new Error(
+      "This table does not advertise any full-text search indexed columns in its published metadata.",
+    );
+  }
+
+  const vectorColumn =
+    request.vectorColumn ??
+    (request.vector !== undefined ? metadata?.defaultVectorColumn : undefined);
+
   return {
     ...request,
+    vectorColumn,
     vector:
       request.vector instanceof Float32Array
         ? Array.from(request.vector)

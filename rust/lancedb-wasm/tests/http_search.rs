@@ -3,7 +3,6 @@
 
 use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -67,7 +66,6 @@ impl TestFixture {
             .execute()
             .await
             .unwrap();
-        write_latest_manifest_copy(&root.path().join("search_table.lance"));
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
@@ -164,25 +162,6 @@ fn make_batch() -> RecordBatch {
         ],
     )
     .unwrap()
-}
-
-fn write_latest_manifest_copy(table_root: &Path) {
-    let versions_dir = table_root.join("_versions");
-    let latest_manifest = latest_manifest_in_dir(&versions_dir);
-    fs::copy(latest_manifest, table_root.join("_latest.manifest")).unwrap();
-}
-
-fn latest_manifest_in_dir(dir: &Path) -> PathBuf {
-    fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("manifest"))
-        .max_by_key(|path| {
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .unwrap()
-        })
-        .unwrap()
 }
 
 fn decode_batches(bytes: Vec<u8>) -> Vec<RecordBatch> {
@@ -287,6 +266,16 @@ async fn opens_reads_schema_and_searches_over_http() {
     assert!(hybrid_ids.iter().all(|id| [1, 3].contains(id)));
 
     let requests = fixture.requests.lock().await.clone();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.ends_with("/search_table.lance/_web.json"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.ends_with("/search_table.lance/_snapshot.json"))
+    );
     assert!(requests.iter().any(|request| {
         request
             .path
@@ -315,7 +304,6 @@ async fn refreshes_to_latest_snapshot() {
     )
     .unwrap();
     fixture.local_table.add(new_row).execute().await.unwrap();
-    write_latest_manifest_copy(&fixture.root.path().join("search_table.lance"));
 
     assert!(remote.refresh().await.unwrap());
 
@@ -338,6 +326,28 @@ async fn refreshes_to_latest_snapshot() {
     );
 
     assert_eq!(ids_from_batches(&batches), vec![4]);
+}
+
+#[tokio::test]
+async fn refresh_uses_latest_version_sidecar_when_snapshot_is_unchanged() {
+    let fixture = TestFixture::new().await;
+    let mut remote = fixture.open_remote(true, OpenTableOptions::default()).await;
+
+    fixture.requests.lock().await.clear();
+    assert!(!remote.refresh().await.unwrap());
+
+    let requests = fixture.requests.lock().await.clone();
+    assert!(requests.iter().any(|request| {
+        request
+            .path
+            .ends_with("/search_table.lance/_latest.version")
+    }));
+    assert!(!requests.iter().any(|request| {
+        request
+            .path
+            .ends_with("/search_table.lance/_latest.manifest")
+            && request.range.as_deref() == Some("bytes=0-0")
+    }));
 }
 
 #[tokio::test]

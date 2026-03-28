@@ -25,26 +25,63 @@ function makeHandle(): jest.Mocked<WasmRemoteSearchHandle> {
   };
 }
 
+function publishedMetadata(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    version: 7,
+    manifestPath: "_versions/7.manifest",
+    manifestNamingScheme: "v2",
+    latestManifestPath: "_latest.manifest",
+    latestVersionPath: "_latest.version",
+    webMetadataPath: "_web.json",
+    snapshotPath: "_snapshot.json",
+    vectorColumns: ["embedding"],
+    ftsColumns: ["doc"],
+    defaultVectorColumn: "embedding",
+    ...overrides,
+  };
+}
+
+function publishedSnapshot(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    ...publishedMetadata(),
+    isComplete: true,
+    ...overrides,
+  };
+}
+
 describe("@lancedb/lancedb-web", () => {
   afterEach(() => {
     __setWasmModuleLoaderForTests();
     jest.restoreAllMocks();
   });
 
-  it("normalizes the table URL, checks range support, and opens the wasm handle", async () => {
+  it("uses published metadata to resolve sidecars and open the wasm handle", async () => {
     const handle = makeHandle();
-    const openTableMock = jest.fn(async () => handle);
+    const openTableMock = jest.fn<
+      Promise<WasmRemoteSearchHandle>,
+      [string, string | undefined]
+    >(async () => handle);
     __setWasmModuleLoaderForTests(async () => ({
       open_table: openTableMock,
     }));
 
-    const fetchMock = jest.fn(async () => {
-      return new Response(new Uint8Array([1]), {
-        status: 206,
-        headers: {
-          "content-range": "bytes 0-0/1",
-        },
-      });
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.endsWith("/_web.json")) {
+        return Response.json(publishedMetadata());
+      }
+      if (url.endsWith("/_snapshot.json")) {
+        return Response.json(publishedSnapshot());
+      }
+      if (url.endsWith("/_latest.manifest")) {
+        return new Response(new Uint8Array([1]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-0/1",
+          },
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
     });
 
     await openTable("https://example.com/search_table.lance", {
@@ -53,6 +90,24 @@ describe("@lancedb/lancedb-web", () => {
       cacheBytes: 4096,
     });
 
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://example.com/search_table.lance/_web.json",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          Authorization: "Bearer token",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://example.com/search_table.lance/_snapshot.json",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          Authorization: "Bearer token",
+        }),
+      }),
+    );
     expect(fetchMock).toHaveBeenCalledWith(
       "https://example.com/search_table.lance/_latest.manifest",
       expect.objectContaining({
@@ -63,16 +118,22 @@ describe("@lancedb/lancedb-web", () => {
         }),
       }),
     );
-    expect(openTableMock).toHaveBeenCalledWith(
+    expect(openTableMock).toHaveBeenCalledTimes(1);
+    const firstOpenCall = openTableMock.mock.calls[0]!;
+    expect(firstOpenCall[0]!).toBe(
       "https://example.com/search_table.lance/",
-      JSON.stringify({
-        headers: { Authorization: "Bearer token" },
-        cacheBytes: 4096,
-      }),
     );
+    expect(JSON.parse(firstOpenCall[1]!)).toEqual({
+      headers: { Authorization: "Bearer token" },
+      cacheBytes: 4096,
+      latestVersionUrl: "https://example.com/search_table.lance/_latest.version",
+      manifestUrl: "https://example.com/search_table.lance/_latest.manifest",
+      snapshotUrl: "https://example.com/search_table.lance/_snapshot.json",
+      webMetadataUrl: "https://example.com/search_table.lance/_web.json",
+    });
   });
 
-  it("decodes schema and search results from Arrow IPC", async () => {
+  it("decodes schema and search results from Arrow IPC and applies published defaults", async () => {
     const handle = makeHandle();
     __setWasmModuleLoaderForTests(async () => ({
       open_table: async () => handle,
@@ -82,18 +143,27 @@ describe("@lancedb/lancedb-web", () => {
       fetch: successfulFetch(),
     });
     const schema = await table.schema();
-    const results = await table.search({ text: "apple" });
+    const results = await table.search({
+      text: "apple",
+      vector: new Float32Array([0, 1]),
+    });
 
     expect(schema.fields.map((field) => field.name)).toEqual(["id", "doc"]);
     expect(results.numRows).toBe(2);
-    expect(handle.search).toHaveBeenCalledWith(JSON.stringify({ text: "apple" }));
+    expect(handle.search).toHaveBeenCalledWith(
+      JSON.stringify({
+        text: "apple",
+        vector: [0, 1],
+        vectorColumn: "embedding",
+      }),
+    );
   });
 
   it("reopens the wasm handle when dynamic headers change", async () => {
     const firstHandle = makeHandle();
     const secondHandle = makeHandle();
     const openTableMock = jest
-      .fn()
+      .fn<Promise<WasmRemoteSearchHandle>, [string, string | undefined]>()
       .mockResolvedValueOnce(firstHandle)
       .mockResolvedValueOnce(secondHandle);
 
@@ -112,15 +182,58 @@ describe("@lancedb/lancedb-web", () => {
     await table.search({ vector: new Float32Array([0, 1]) });
 
     expect(firstHandle.close).toHaveBeenCalledTimes(1);
-    expect(openTableMock).toHaveBeenNthCalledWith(
-      2,
+    const secondOpenCall = openTableMock.mock.calls[1]!;
+    expect(secondOpenCall[0]!).toBe(
       "https://example.com/search_table.lance/",
-      JSON.stringify({
-        headers: { Authorization: "token-b" },
-      }),
     );
+    expect(JSON.parse(secondOpenCall[1]!)).toEqual({
+      headers: { Authorization: "token-b" },
+      latestVersionUrl: "https://example.com/search_table.lance/_latest.version",
+      manifestUrl: "https://example.com/search_table.lance/_latest.manifest",
+      snapshotUrl: "https://example.com/search_table.lance/_snapshot.json",
+      webMetadataUrl: "https://example.com/search_table.lance/_web.json",
+    });
     table.close();
     expect(secondHandle.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses _latest.version to skip reopening when the snapshot is unchanged", async () => {
+    const handle = makeHandle();
+    const openTableMock = jest.fn<
+      Promise<WasmRemoteSearchHandle>,
+      [string, string | undefined]
+    >(async () => handle);
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: openTableMock,
+    }));
+
+    const fetchMock = sidecarFetch({
+      latestVersion: "7",
+    });
+
+    const table = await openTable("https://example.com/search_table.lance", {
+      fetch: fetchMock,
+    });
+    expect(await table.refresh()).toBe(false);
+    expect(handle.refresh).not.toHaveBeenCalled();
+    expect(openTableMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails fast when published metadata advertises no FTS index", async () => {
+    const handle = makeHandle();
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: async () => handle,
+    }));
+
+    const table = await openTable("https://example.com/search_table.lance", {
+      fetch: sidecarFetch({
+        metadata: publishedMetadata({ ftsColumns: [] }),
+        snapshot: publishedSnapshot({ ftsColumns: [] }),
+      }),
+    });
+
+    await expect(table.search({ text: "apple" })).rejects.toThrow(/full-text search indexed columns/);
+    expect(handle.search).not.toHaveBeenCalled();
   });
 
   it("fails fast when range support is missing", async () => {
@@ -130,19 +243,50 @@ describe("@lancedb/lancedb-web", () => {
 
     await expect(
       openTable("https://example.com/search_table.lance", {
-        fetch: (async () =>
-          new Response(null, { status: 200 })) as unknown as typeof globalThis.fetch,
+        fetch: (async (input: RequestInfo | URL) => {
+          const url = input.toString();
+          if (url.endsWith("/_web.json") || url.endsWith("/_snapshot.json")) {
+            return new Response(null, { status: 404 });
+          }
+          return new Response(null, { status: 200 });
+        }) as unknown as typeof globalThis.fetch,
       }),
     ).rejects.toThrow(/Expected status 206/);
   });
 });
 
 function successfulFetch(): typeof globalThis.fetch {
-  return (async () =>
-    new Response(new Uint8Array([1]), {
-      status: 206,
-      headers: {
-        "content-range": "bytes 0-0/1",
-      },
-    })) as unknown as typeof globalThis.fetch;
+  return sidecarFetch();
+}
+
+function sidecarFetch({
+  latestVersion = "7",
+  metadata = publishedMetadata(),
+  snapshot = publishedSnapshot(),
+}: {
+  latestVersion?: string;
+  metadata?: Record<string, unknown>;
+  snapshot?: Record<string, unknown>;
+} = {}): typeof globalThis.fetch {
+  return (async (input: RequestInfo | URL) => {
+    const url = input.toString();
+    if (url.endsWith("/_web.json")) {
+      return Response.json(metadata);
+    }
+    if (url.endsWith("/_snapshot.json")) {
+      return Response.json(snapshot);
+    }
+    if (url.endsWith("/_latest.version")) {
+      return new Response(latestVersion, { status: 200 });
+    }
+    if (url.endsWith("/_latest.manifest")) {
+      return new Response(new Uint8Array([1]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-0/1",
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as unknown as typeof globalThis.fetch;
 }
