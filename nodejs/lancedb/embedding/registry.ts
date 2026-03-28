@@ -5,6 +5,7 @@ import {
   type EmbeddingFunction,
   type EmbeddingFunctionConstructor,
 } from "./embedding_function";
+import { detectProvider, parseLlmUri } from "./llm_uri";
 import "reflect-metadata";
 
 export type CreateReturnType<T> = T extends { init: () => Promise<void> }
@@ -89,6 +90,74 @@ export class EmbeddingFunctionRegistry {
     return {
       create,
     };
+  }
+
+  /**
+   * Create an embedding function from an `llm://` URI string.
+   *
+   * The URI host is mapped to a registered embedding function name
+   * (e.g. `api.openai.com` -> `"openai"`). The model from the URI path
+   * and any API key from the userinfo are forwarded as options to the
+   * embedding function constructor.
+   *
+   * Additional query parameters are merged into the options object,
+   * allowing provider-specific settings like `dimensions` to be
+   * configured via the URI.
+   *
+   * @param uri - An `llm://` URI string
+   * @returns The created embedding function instance
+   * @throws Error if the URI scheme is not `llm://`
+   * @throws Error if no registered embedding function matches the host
+   *
+   * @example
+   * ```ts
+   * const registry = getRegistry();
+   *
+   * // Basic usage — creates an OpenAI embedding function
+   * const func = registry.fromUri("llm://api.openai.com/text-embedding-3-small");
+   *
+   * // With API key and parameters
+   * const func2 = registry.fromUri(
+   *   "llm://myapp:sk-abc@api.openai.com/text-embedding-3-large?dimensions=1024"
+   * );
+   *
+   * // Use with LanceSchema
+   * const schema = LanceSchema({
+   *   text: func.sourceField(new Utf8()),
+   *   vector: func.vectorField(),
+   * });
+   * ```
+   */
+  fromUri(uri: string): EmbeddingFunction;
+  fromUri(uri: string) {
+    const config = parseLlmUri(uri);
+    const provider = detectProvider(config.host);
+
+    // Try the detected provider name, then fall back to the raw host
+    const alias = provider ?? config.host;
+    const factory = this.get(alias);
+    if (!factory) {
+      const known = provider
+        ? `"${provider}" (from host "${config.host}")`
+        : `"${config.host}"`;
+      throw new Error(
+        `No embedding function registered for ${known}. ` +
+          "Register one with @register() or use registry.get() directly.",
+      );
+    }
+
+    // Build options from URI components.
+    // biome-ignore lint/suspicious/noExplicitAny: options are function-specific
+    const options: Record<string, any> = {
+      model: config.model,
+      ...config.params,
+    };
+
+    if (config.apiKey) {
+      options.apiKey = config.apiKey;
+    }
+
+    return factory.create(options);
   }
 
   /**

@@ -15,6 +15,8 @@ export {
 } from "./embedding_function";
 
 export * from "./registry";
+export { parseLlmUri, detectProvider, isLlmUri } from "./llm_uri";
+export type { LlmUriConfig } from "./llm_uri";
 
 /**
  * Create a schema with embedding functions.
