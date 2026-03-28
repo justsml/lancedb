@@ -1,10 +1,12 @@
 import { tableFromArrays, tableToIPC } from "apache-arrow";
 import {
   __setWasmModuleLoaderForTests,
+  __setWorkerFactoryForTests,
   openTable,
   type OpenTableOptions,
 } from "../src";
 import type { WasmRemoteSearchHandle } from "../src/generated/lancedb_wasm";
+import type { WorkerRequest, WorkerResponse } from "../src/worker_protocol";
 
 function makeArrowIpc() {
   return tableToIPC(
@@ -52,6 +54,7 @@ function publishedSnapshot(overrides: Partial<Record<string, unknown>> = {}) {
 describe("@lancedb/lancedb-web", () => {
   afterEach(() => {
     __setWasmModuleLoaderForTests();
+    __setWorkerFactoryForTests();
     jest.restoreAllMocks();
   });
 
@@ -157,6 +160,64 @@ describe("@lancedb/lancedb-web", () => {
         vectorColumn: "embedding",
       }),
     );
+  });
+
+  it("uses a worker backend when available", async () => {
+    const directOpenMock = jest.fn<
+      Promise<WasmRemoteSearchHandle>,
+      [string, string | undefined]
+    >();
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: directOpenMock,
+    }));
+
+    const handle = makeHandle();
+    const worker = makeWorker(handle);
+    __setWorkerFactoryForTests(() => worker);
+
+    const table = await openTable("https://example.com/search_table.lance", {
+      fetch: successfulFetch(),
+    });
+    const schema = await table.schema();
+    const results = await table.search({
+      vector: new Float32Array([0, 1]),
+    });
+
+    expect(schema.fields.map((field) => field.name)).toEqual(["id", "doc"]);
+    expect(results.numRows).toBe(2);
+    expect(handle.schema).toHaveBeenCalledTimes(1);
+    expect(handle.search).toHaveBeenCalledWith(
+      JSON.stringify({
+        vector: [0, 1],
+        vectorColumn: "embedding",
+      }),
+    );
+    expect(directOpenMock).not.toHaveBeenCalled();
+
+    table.close();
+    expect(worker.terminate).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the direct runtime when worker init fails", async () => {
+    const handle = makeHandle();
+    const openTableMock = jest.fn<
+      Promise<WasmRemoteSearchHandle>,
+      [string, string | undefined]
+    >(async () => handle);
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: openTableMock,
+    }));
+    __setWorkerFactoryForTests(() => makeWorker(makeHandle(), { failOpen: true }));
+
+    const table = await openTable("https://example.com/search_table.lance", {
+      fetch: successfulFetch(),
+    });
+    await table.search({
+      vector: new Float32Array([0, 1]),
+    });
+
+    expect(openTableMock).toHaveBeenCalledTimes(1);
+    expect(handle.search).toHaveBeenCalledTimes(1);
   });
 
   it("reopens the wasm handle when dynamic headers change", async () => {
@@ -289,4 +350,126 @@ function sidecarFetch({
     }
     throw new Error(`unexpected fetch ${url}`);
   }) as unknown as typeof globalThis.fetch;
+}
+
+function makeWorker(
+  handle: jest.Mocked<WasmRemoteSearchHandle>,
+  options: { failOpen?: boolean } = {},
+) {
+  const messageListeners = new Set<
+    (event: MessageEvent<WorkerResponse>) => void
+  >();
+  const errorListeners = new Set<(event: ErrorEvent) => void>();
+
+  const emitMessage = (response: WorkerResponse) => {
+    const event = { data: response } as MessageEvent<WorkerResponse>;
+    for (const listener of messageListeners) {
+      listener(event);
+    }
+  };
+
+  const worker = {
+    addEventListener: jest.fn(
+      (
+        type: "message" | "error",
+        listener:
+          | ((event: MessageEvent<WorkerResponse>) => void)
+          | ((event: ErrorEvent) => void),
+      ) => {
+        if (type === "message") {
+          messageListeners.add(
+            listener as (event: MessageEvent<WorkerResponse>) => void,
+          );
+          return;
+        }
+        errorListeners.add(listener as (event: ErrorEvent) => void);
+      },
+    ),
+    removeEventListener: jest.fn(
+      (
+        type: "message" | "error",
+        listener:
+          | ((event: MessageEvent<WorkerResponse>) => void)
+          | ((event: ErrorEvent) => void),
+      ) => {
+        if (type === "message") {
+          messageListeners.delete(
+            listener as (event: MessageEvent<WorkerResponse>) => void,
+          );
+          return;
+        }
+        errorListeners.delete(listener as (event: ErrorEvent) => void);
+      },
+    ),
+    postMessage: jest.fn((request: WorkerRequest) => {
+      queueMicrotask(async () => {
+        try {
+          switch (request.type) {
+            case "open":
+              if (options.failOpen) {
+                emitMessage({
+                  id: request.id,
+                  ok: false,
+                  error: "worker open failed",
+                });
+              } else {
+                emitMessage({
+                  id: request.id,
+                  ok: true,
+                  type: "open",
+                });
+              }
+              return;
+            case "schema": {
+              const bytes = await handle.schema();
+              emitMessage({
+                id: request.id,
+                ok: true,
+                type: "schema",
+                bytes: copyBuffer(bytes),
+              });
+              return;
+            }
+            case "search": {
+              const bytes = await handle.search(request.requestJson);
+              emitMessage({
+                id: request.id,
+                ok: true,
+                type: "search",
+                bytes: copyBuffer(bytes),
+              });
+              return;
+            }
+            case "refresh":
+              emitMessage({
+                id: request.id,
+                ok: true,
+                type: "refresh",
+                changed: await handle.refresh(),
+              });
+              return;
+            default:
+              request satisfies never;
+          }
+        } catch (error) {
+          const event = {
+            message: error instanceof Error ? error.message : String(error),
+          } as ErrorEvent;
+          for (const listener of errorListeners) {
+            listener(event);
+          }
+        }
+      });
+    }),
+    terminate: jest.fn(),
+  };
+
+  return worker;
+}
+
+function copyBuffer(bytes: Uint8Array): ArrayBuffer {
+  const owned = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+    ? new Uint8Array(bytes)
+    : bytes.slice();
+  return owned.buffer.slice(0) as ArrayBuffer;
 }

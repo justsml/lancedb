@@ -7,21 +7,36 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+#[cfg(target_arch = "wasm32")]
+use arrow_array::RecordBatch;
+#[cfg(target_arch = "wasm32")]
+use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
+#[cfg(not(target_arch = "wasm32"))]
 use futures::TryStreamExt;
+#[cfg(not(target_arch = "wasm32"))]
 use lance::dataset::ReadParams;
+#[cfg(not(target_arch = "wasm32"))]
 use lance::session::Session;
-use lance_index::scalar::FullTextSearchQuery;
 use lance_io::object_store::WrappingObjectStore;
+#[cfg(not(target_arch = "wasm32"))]
 use lance_table::format::{IndexMetadata, Manifest, Transaction};
+#[cfg(not(target_arch = "wasm32"))]
 use lance_table::io::commit::{
     CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use lance_table::io::manifest::read_manifest;
+#[cfg(not(target_arch = "wasm32"))]
 use lancedb::ipc::{batches_to_ipc_file, schema_to_ipc_file};
+#[cfg(not(target_arch = "wasm32"))]
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+#[cfg(not(target_arch = "wasm32"))]
 use lancedb::table::{BaseTable, NativeTable};
+#[cfg(not(target_arch = "wasm32"))]
 use lancedb::{Error, Result, Table};
+#[cfg(target_arch = "wasm32")]
+use local_error::{Error, Result};
 use object_store::path::Path;
 use object_store::{
     DynObjectStore, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
@@ -42,6 +57,107 @@ mod fetch_object_store;
 use fetch_object_store::FetchHttpStore;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+
+#[cfg(not(target_arch = "wasm32"))]
+use lance_index::scalar::FullTextSearchQuery;
+#[cfg(any(target_arch = "wasm32", test))]
+mod browser;
+#[cfg(target_arch = "wasm32")]
+use browser::BrowserTable;
+
+#[cfg(any(target_arch = "wasm32", test))]
+mod local_error {
+    use std::fmt::{Display, Formatter};
+
+    use arrow_schema::ArrowError;
+    use lance_core::Error as LanceError;
+
+    pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+    pub type Result<T> = std::result::Result<T, Error>;
+
+    #[derive(Debug)]
+    pub enum Error {
+        InvalidInput {
+            message: String,
+        },
+        Runtime {
+            message: String,
+        },
+        NotSupported {
+            message: String,
+        },
+        ObjectStore {
+            source: object_store::Error,
+        },
+        Lance {
+            source: LanceError,
+        },
+        Arrow {
+            source: ArrowError,
+        },
+        Other {
+            message: String,
+            source: Option<BoxError>,
+        },
+    }
+
+    impl Display for Error {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::InvalidInput { message } => write!(f, "Invalid input, {message}"),
+                Self::Runtime { message } => write!(f, "Runtime error: {message}"),
+                Self::NotSupported { message } => {
+                    write!(f, "LanceDBError: not supported: {message}")
+                }
+                Self::ObjectStore { source } => write!(f, "object_store error: {source}"),
+                Self::Lance { source } => write!(f, "lance error: {source}"),
+                Self::Arrow { source } => write!(f, "Arrow error: {source}"),
+                Self::Other { message, .. } => write!(f, "{message}"),
+            }
+        }
+    }
+
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::ObjectStore { source } => Some(source),
+                Self::Lance { source } => Some(source),
+                Self::Arrow { source } => Some(source),
+                Self::Other {
+                    source: Some(source),
+                    ..
+                } => Some(source.as_ref()),
+                _ => None,
+            }
+        }
+    }
+
+    impl From<object_store::Error> for Error {
+        fn from(source: object_store::Error) -> Self {
+            Self::ObjectStore { source }
+        }
+    }
+
+    impl From<object_store::path::Error> for Error {
+        fn from(source: object_store::path::Error) -> Self {
+            Self::ObjectStore {
+                source: object_store::Error::InvalidPath { source },
+            }
+        }
+    }
+
+    impl From<LanceError> for Error {
+        fn from(source: LanceError) -> Self {
+            Self::Lance { source }
+        }
+    }
+
+    impl From<ArrowError> for Error {
+        fn from(source: ArrowError) -> Self {
+            Self::Arrow { source }
+        }
+    }
+}
 
 // Current Lance latest-version resolution relies on listing `_versions/`.
 // For generic static HTTP hosting we instead resolve through a deterministic
@@ -145,11 +261,16 @@ struct ResolvedPublishedState {
 #[derive(Clone)]
 pub struct RemoteSearchTable {
     table_url: String,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     table_name: String,
     options: OpenTableOptions,
     published: ResolvedPublishedState,
+    #[cfg(not(target_arch = "wasm32"))]
     session: Arc<Session>,
+    #[cfg(not(target_arch = "wasm32"))]
     table: Option<Table>,
+    #[cfg(target_arch = "wasm32")]
+    table: Option<BrowserTable>,
 }
 
 impl RemoteSearchTable {
@@ -157,8 +278,10 @@ impl RemoteSearchTable {
         let table_url = normalize_table_url(table_url)?;
         let table_name = table_name_from_url(&table_url)?;
         let published = resolve_published_state(&table_url, &options).await?;
+        #[cfg(not(target_arch = "wasm32"))]
         let session = Arc::new(session_from_cache_bytes(options.cache_bytes));
-        let table = open_table_with_options(
+        #[cfg(not(target_arch = "wasm32"))]
+        let opened = open_table_with_options(
             &table_url,
             &table_name,
             &options,
@@ -166,46 +289,50 @@ impl RemoteSearchTable {
             session.clone(),
         )
         .await?;
+        #[cfg(target_arch = "wasm32")]
+        let opened = BrowserTable::open(&table_url, &options, &published.manifest_url).await?;
 
         Ok(Self {
             table_url,
             table_name,
             options,
             published,
+            #[cfg(not(target_arch = "wasm32"))]
             session,
-            table: Some(table),
+            #[cfg(not(target_arch = "wasm32"))]
+            table: Some(opened),
+            #[cfg(target_arch = "wasm32")]
+            table: Some(opened),
         })
     }
 
     pub async fn schema(&self) -> Result<Vec<u8>> {
-        let table = self.table_ref()?;
-        let schema = table.schema().await?;
-        schema_to_ipc_file(schema.as_ref())
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let table = self.table_ref()?;
+            let schema = table.schema().await?;
+            schema_to_ipc_file(schema.as_ref())
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let table = self.browser_table_ref()?;
+            schema_to_ipc_file(&ArrowSchema::from(table.schema()))
+        }
     }
 
     pub async fn search(&self, request: SearchRequest) -> Result<Vec<u8>> {
-        let table = self.table_ref()?;
         let request = apply_published_request_defaults(request, &self.published)?;
-        match (request.vector.clone(), request.text.clone()) {
-            (Some(vector), text) => {
-                let mut query = table.query().nearest_to(vector)?;
-                if let Some(text) = text {
-                    query = query.full_text_search(build_fts_query(text)?);
-                }
-                query = apply_common_query(query, &request);
-                if let Some(vector_column) = request.vector_column.as_deref() {
-                    query = query.column(vector_column);
-                }
-                execute_query(query).await
-            }
-            (None, text) => {
-                let mut query = table.query();
-                if let Some(text) = text {
-                    query = query.full_text_search(build_fts_query(text)?);
-                }
-                query = apply_common_query(query, &request);
-                execute_query(query).await
-            }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let table = self.table_ref()?;
+            execute_table_search(table, request).await
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let table = self.browser_table_ref()?;
+            execute_browser_search(table, request).await
         }
     }
 
@@ -228,8 +355,12 @@ impl RemoteSearchTable {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let current_version = self.table_ref()?.version().await?;
+        #[cfg(target_arch = "wasm32")]
+        let current_version = self.browser_table_ref()?.version();
         let published = resolve_published_state(&self.table_url, &self.options).await?;
+        #[cfg(not(target_arch = "wasm32"))]
         let reopened = open_table_with_options(
             &self.table_url,
             &self.table_name,
@@ -238,17 +369,45 @@ impl RemoteSearchTable {
             self.session.clone(),
         )
         .await?;
+        #[cfg(target_arch = "wasm32")]
+        let reopened =
+            BrowserTable::open(&self.table_url, &self.options, &published.manifest_url).await?;
+        #[cfg(not(target_arch = "wasm32"))]
         let next_version = reopened.version().await?;
-        self.table = Some(reopened);
+        #[cfg(target_arch = "wasm32")]
+        let next_version = reopened.version();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.table = Some(reopened);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.table = Some(reopened);
+        }
         self.published = published;
         Ok(next_version != current_version)
     }
 
     pub fn close(&mut self) {
-        self.table = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.table = None;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.table = None;
+        }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn table_ref(&self) -> Result<&Table> {
+        self.table.as_ref().ok_or_else(|| Error::Runtime {
+            message: "table is closed".to_string(),
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn browser_table_ref(&self) -> Result<&BrowserTable> {
         self.table.as_ref().ok_or_else(|| Error::Runtime {
             message: "table is closed".to_string(),
         })
@@ -469,6 +628,7 @@ impl PublishedMetadataView<'_> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn session_from_cache_bytes(cache_bytes: Option<usize>) -> Session {
     match cache_bytes {
         Some(cache_bytes) => {
@@ -480,6 +640,7 @@ fn session_from_cache_bytes(cache_bytes: Option<usize>) -> Session {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn open_table_with_options(
     table_url: &str,
     table_name: &str,
@@ -643,9 +804,11 @@ async fn preflight_manifest_check(store: Arc<DynObjectStore>, manifest_path: &Pa
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 struct LatestManifestCommitHandler;
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl CommitHandler for LatestManifestCommitHandler {
     async fn resolve_latest_location(
@@ -675,6 +838,7 @@ impl CommitHandler for LatestManifestCommitHandler {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn manifest_location_from_latest_copy(
     path: Path,
     meta: ObjectMeta,
@@ -701,6 +865,7 @@ fn object_store_table_path(table_url: &Url) -> Result<Path> {
     Path::from_url_path(table_url.path()).map_err(Error::from)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_fts_query(request: TextRequest) -> Result<FullTextSearchQuery> {
     match request {
         TextRequest::Query(query) => Ok(FullTextSearchQuery::new(query)),
@@ -715,6 +880,42 @@ fn build_fts_query(request: TextRequest) -> Result<FullTextSearchQuery> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+async fn execute_table_search(table: &Table, request: SearchRequest) -> Result<Vec<u8>> {
+    match (request.vector.clone(), request.text.clone()) {
+        (Some(vector), text) => {
+            let mut query = table.query().nearest_to(vector)?;
+            if let Some(text) = text {
+                query = query.full_text_search(build_fts_query(text)?);
+            }
+            query = apply_common_query(query, &request);
+            if let Some(vector_column) = request.vector_column.as_deref() {
+                query = query.column(vector_column);
+            }
+            execute_query(query).await
+        }
+        (None, text) => {
+            let mut query = table.query();
+            if let Some(text) = text {
+                query = query.full_text_search(build_fts_query(text)?);
+            }
+            query = apply_common_query(query, &request);
+            execute_query(query).await
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn execute_browser_search(table: &BrowserTable, request: SearchRequest) -> Result<Vec<u8>> {
+    let result_schema = table.result_schema(&request)?;
+    let batches = table.search_batches(request).await?;
+    if batches.is_empty() {
+        return schema_to_ipc_file(&result_schema);
+    }
+    batches_to_ipc_file(&batches)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn apply_common_query<Q: QueryBase>(mut query: Q, request: &SearchRequest) -> Q {
     if let Some(limit) = request.limit {
         query = query.limit(limit);
@@ -748,6 +949,7 @@ fn apply_common_query<Q: QueryBase>(mut query: Q, request: &SearchRequest) -> Q 
     query
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn execute_query<Q>(query: Q) -> Result<Vec<u8>>
 where
     Q: ExecutableQuery,
@@ -759,6 +961,34 @@ where
         return schema_to_ipc_file(schema.as_ref());
     }
     batches_to_ipc_file(&batches)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn batches_to_ipc_file(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    use arrow_ipc::writer::FileWriter;
+
+    if batches.is_empty() {
+        return Err(Error::Other {
+            message: "No batches to write".to_string(),
+            source: None,
+        });
+    }
+    let schema = batches[0].schema();
+    let mut writer = FileWriter::try_new(vec![], &schema)?;
+    for batch in batches {
+        writer.write(batch)?;
+    }
+    writer.finish()?;
+    Ok(writer.into_inner()?)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn schema_to_ipc_file(schema: &ArrowSchema) -> Result<Vec<u8>> {
+    use arrow_ipc::writer::FileWriter;
+
+    let mut writer = FileWriter::try_new(vec![], schema)?;
+    writer.finish()?;
+    Ok(writer.into_inner()?)
 }
 
 #[derive(Debug)]

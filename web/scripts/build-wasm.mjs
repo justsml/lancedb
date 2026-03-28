@@ -53,37 +53,24 @@ function ensureWasmBindgen() {
 function buildRustWasm() {
   const existingRustflags = process.env.RUSTFLAGS?.trim();
   const getrandomFlag = '--cfg getrandom_backend="wasm_js"';
-  try {
-    run(
-      "cargo",
-      [
-        "build",
-        "-p",
-        "lancedb-wasm",
-        "--target",
-        "wasm32-unknown-unknown",
-        "--release",
-      ],
-      repoRoot,
-      {
-        ...process.env,
-        RUSTFLAGS: existingRustflags
-          ? `${existingRustflags} ${getrandomFlag}`
-          : getrandomFlag,
-      },
-    );
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : String(error);
-    throw new Error(
-      [
-        "The Rust lancedb-wasm crate does not yet build cleanly for wasm32-unknown-unknown in this repository.",
-        "Current blockers are in upstream/native dependencies rather than the JS packaging layer.",
-        "Known issues include object-store cloud/http networking paths and native compression dependencies such as zstd.",
-        message,
-      ].join("\n"),
-    );
-  }
+  run(
+    "cargo",
+    [
+      "build",
+      "-p",
+      "lancedb-wasm",
+      "--target",
+      "wasm32-unknown-unknown",
+      "--release",
+    ],
+    repoRoot,
+    {
+      ...process.env,
+      RUSTFLAGS: existingRustflags
+        ? `${existingRustflags} ${getrandomFlag}`
+        : getrandomFlag,
+    },
+  );
 }
 
 function runWasmBindgen() {

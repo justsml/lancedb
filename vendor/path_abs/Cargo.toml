@@ -1,0 +1,9 @@
+[package]
+name = "path_abs"
+version = "0.5.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Minimal path_abs shim for LanceDB wasm builds"
+
+[lib]
+path = "src/lib.rs"

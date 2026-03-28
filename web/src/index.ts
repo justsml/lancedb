@@ -3,6 +3,11 @@ import type {
   WasmModule,
   WasmRemoteSearchHandle,
 } from "./generated/lancedb_wasm.js";
+import type {
+  WorkerRequest,
+  WorkerResponse,
+  WorkerSuccessResponse,
+} from "./worker_protocol.js";
 
 export interface OpenTableOptions {
   fetch?: typeof globalThis.fetch;
@@ -10,6 +15,8 @@ export interface OpenTableOptions {
   cacheBytes?: number;
   maxConcurrentRanges?: number;
   manifestUrl?: string;
+  noWorker?: boolean;
+  workerInitTimeoutMs?: number;
 }
 
 export type HeaderProvider =
@@ -40,7 +47,10 @@ export interface RemoteSearchTable {
   close(): void;
 }
 
-type OpenOptionsPayload = Omit<OpenTableOptions, "fetch" | "headers"> & {
+type OpenOptionsPayload = Omit<
+  OpenTableOptions,
+  "fetch" | "headers" | "noWorker" | "workerInitTimeoutMs"
+> & {
   headers?: Record<string, string>;
   latestVersionUrl?: string;
   snapshotUrl?: string;
@@ -86,8 +96,226 @@ interface ResolvedPublishedState {
   webMetadataUrl: string;
 }
 
+interface WorkerLike {
+  addEventListener(
+    type: "message",
+    listener: (event: MessageEvent<WorkerResponse>) => void,
+  ): void;
+  addEventListener(type: "error", listener: (event: ErrorEvent) => void): void;
+  removeEventListener(
+    type: "message",
+    listener: (event: MessageEvent<WorkerResponse>) => void,
+  ): void;
+  removeEventListener(type: "error", listener: (event: ErrorEvent) => void): void;
+  postMessage(message: WorkerRequest): void;
+  terminate(): void;
+}
+
+interface HandleBackend {
+  schema(): Promise<Uint8Array>;
+  search(requestJson: string): Promise<Uint8Array>;
+  refresh(): Promise<boolean>;
+  close(): void;
+}
+
+type WorkerFactory = () => Promise<WorkerLike> | WorkerLike;
+
+const DEFAULT_WORKER_INIT_TIMEOUT_MS = 10_000;
+
 let wasmModuleLoader: () => Promise<WasmModule> = async () =>
   (await import("./generated/lancedb_wasm.js")) as WasmModule;
+let workerFactoryOverride: WorkerFactory | null = null;
+
+class DirectHandleBackend implements HandleBackend {
+  static async open(
+    tableUrl: string,
+    optionsJson?: string,
+  ): Promise<DirectHandleBackend> {
+    const wasmModule = await wasmModuleLoader();
+    return new DirectHandleBackend(await wasmModule.open_table(tableUrl, optionsJson));
+  }
+
+  readonly #handle: WasmRemoteSearchHandle;
+
+  private constructor(handle: WasmRemoteSearchHandle) {
+    this.#handle = handle;
+  }
+
+  schema(): Promise<Uint8Array> {
+    return this.#handle.schema();
+  }
+
+  search(requestJson: string): Promise<Uint8Array> {
+    return this.#handle.search(requestJson);
+  }
+
+  refresh(): Promise<boolean> {
+    return this.#handle.refresh();
+  }
+
+  close(): void {
+    this.#handle.close();
+  }
+}
+
+class WorkerHandleBackend implements HandleBackend {
+  static async open(
+    tableUrl: string,
+    optionsJson: string | undefined,
+    timeoutMs: number,
+  ): Promise<WorkerHandleBackend> {
+    const worker = await createWorker();
+    if (worker === null) {
+      throw new Error("Workers are not available in this runtime.");
+    }
+
+    const backend = new WorkerHandleBackend(worker);
+    try {
+      const response = await backend.#request(
+        {
+          id: 0,
+          type: "open",
+          tableUrl,
+          optionsJson,
+        },
+        timeoutMs,
+      );
+      if (response.type !== "open") {
+        throw new Error(`Unexpected worker response type "${response.type}"`);
+      }
+      return backend;
+    } catch (error) {
+      backend.close();
+      throw error;
+    }
+  }
+
+  readonly #worker: WorkerLike;
+  readonly #pending = new Map<
+    number,
+    {
+      timeout: ReturnType<typeof setTimeout>;
+      resolve: (response: WorkerSuccessResponse) => void;
+      reject: (reason?: unknown) => void;
+    }
+  >();
+  readonly #onMessage: (event: MessageEvent<WorkerResponse>) => void;
+  readonly #onError: (event: ErrorEvent) => void;
+  #closed = false;
+  #nextRequestId = 1;
+
+  private constructor(worker: WorkerLike) {
+    this.#worker = worker;
+    this.#onMessage = (event) => {
+      const response = event.data;
+      const pending = this.#pending.get(response.id);
+      if (pending === undefined) {
+        return;
+      }
+
+      clearTimeout(pending.timeout);
+      this.#pending.delete(response.id);
+      if (!response.ok) {
+        pending.reject(new Error(response.error));
+        return;
+      }
+      pending.resolve(response);
+    };
+    this.#onError = (event) => {
+      this.#rejectPending(
+        new Error(
+          event.message.length > 0
+            ? event.message
+            : "Remote search worker failed unexpectedly.",
+        ),
+      );
+    };
+
+    this.#worker.addEventListener("message", this.#onMessage);
+    this.#worker.addEventListener("error", this.#onError);
+  }
+
+  async schema(): Promise<Uint8Array> {
+    const response = await this.#request({
+      id: this.#nextId(),
+      type: "schema",
+    });
+    if (response.type !== "schema") {
+      throw new Error(`Unexpected worker response type "${response.type}"`);
+    }
+    return new Uint8Array(response.bytes);
+  }
+
+  async search(requestJson: string): Promise<Uint8Array> {
+    const response = await this.#request({
+      id: this.#nextId(),
+      type: "search",
+      requestJson,
+    });
+    if (response.type !== "search") {
+      throw new Error(`Unexpected worker response type "${response.type}"`);
+    }
+    return new Uint8Array(response.bytes);
+  }
+
+  async refresh(): Promise<boolean> {
+    const response = await this.#request({
+      id: this.#nextId(),
+      type: "refresh",
+    });
+    if (response.type !== "refresh") {
+      throw new Error(`Unexpected worker response type "${response.type}"`);
+    }
+    return response.changed;
+  }
+
+  close(): void {
+    if (this.#closed) {
+      return;
+    }
+
+    this.#closed = true;
+    this.#worker.removeEventListener("message", this.#onMessage);
+    this.#worker.removeEventListener("error", this.#onError);
+    this.#rejectPending(new Error("Remote search worker was closed."));
+    this.#worker.terminate();
+  }
+
+  #nextId(): number {
+    return this.#nextRequestId++;
+  }
+
+  async #request(
+    request: WorkerRequest,
+    timeoutMs = DEFAULT_WORKER_INIT_TIMEOUT_MS,
+  ): Promise<WorkerSuccessResponse> {
+    if (this.#closed) {
+      throw new Error("Remote search worker is closed");
+    }
+
+    return await new Promise<WorkerSuccessResponse>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.#pending.delete(request.id);
+        reject(
+          new Error(
+            `Remote search worker request "${request.type}" timed out after ${timeoutMs}ms.`,
+          ),
+        );
+      }, timeoutMs);
+
+      this.#pending.set(request.id, { timeout, resolve, reject });
+      this.#worker.postMessage(request);
+    });
+  }
+
+  #rejectPending(error: Error): void {
+    for (const { timeout, reject } of this.#pending.values()) {
+      clearTimeout(timeout);
+      reject(error);
+    }
+    this.#pending.clear();
+  }
+}
 
 export function __setWasmModuleLoaderForTests(
   loader?: () => Promise<WasmModule>,
@@ -95,6 +323,12 @@ export function __setWasmModuleLoaderForTests(
   wasmModuleLoader =
     loader ??
     (async () => (await import("./generated/lancedb_wasm.js")) as WasmModule);
+}
+
+export function __setWorkerFactoryForTests(
+  factory?: WorkerFactory | null,
+): void {
+  workerFactoryOverride = factory ?? null;
 }
 
 export async function openTable(
@@ -108,24 +342,21 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
   #tableUrl: string;
   #options: OpenTableOptions;
   #headersSignature: string;
-  #handle: WasmRemoteSearchHandle | null;
+  #handle: HandleBackend | null;
   #published: ResolvedPublishedState;
-  #wasmModule: WasmModule;
 
   private constructor(
     tableUrl: string,
     options: OpenTableOptions,
     headersSignature: string,
-    handle: WasmRemoteSearchHandle,
+    handle: HandleBackend,
     published: ResolvedPublishedState,
-    wasmModule: WasmModule,
   ) {
     this.#tableUrl = tableUrl;
     this.#options = options;
     this.#headersSignature = headersSignature;
     this.#handle = handle;
     this.#published = published;
-    this.#wasmModule = wasmModule;
   }
 
   static async open(
@@ -140,10 +371,10 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
       options,
     );
     await preflightOpen(published.manifestUrl, headers, options);
-    const wasmModule = await wasmModuleLoader();
-    const handle = await wasmModule.open_table(
+    const handle = await openHandleBackend(
       normalizedTableUrl,
       JSON.stringify(makeOpenOptionsPayload(options, headers, published)),
+      options,
     );
 
     return new RemoteSearchTableImpl(
@@ -152,7 +383,6 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
       stableHeaderSignature(headers),
       handle,
       published,
-      wasmModule,
     );
   }
 
@@ -238,15 +468,36 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
     );
     await preflightOpen(published.manifestUrl, resolvedHeaders, this.#options);
     this.#handle!.close();
-    this.#handle = await this.#wasmModule.open_table(
+    this.#handle = await openHandleBackend(
       this.#tableUrl,
       JSON.stringify(
         makeOpenOptionsPayload(this.#options, resolvedHeaders, published),
       ),
+      this.#options,
     );
     this.#headersSignature = nextSignature;
     this.#published = published;
   }
+}
+
+async function openHandleBackend(
+  tableUrl: string,
+  optionsJson: string | undefined,
+  options: OpenTableOptions,
+): Promise<HandleBackend> {
+  if (!options.noWorker) {
+    try {
+      return await WorkerHandleBackend.open(
+        tableUrl,
+        optionsJson,
+        options.workerInitTimeoutMs ?? DEFAULT_WORKER_INIT_TIMEOUT_MS,
+      );
+    } catch {
+      // Fall through to the direct runtime if the worker path is unavailable.
+    }
+  }
+
+  return await DirectHandleBackend.open(tableUrl, optionsJson);
 }
 
 function normalizeHttpUrl(value: string, label: string): string {
@@ -478,4 +729,19 @@ function normalizeSearchRequest(
 
 function decodeSchema(bytes: Uint8Array): Schema {
   return tableFromIPC(bytes).schema;
+}
+
+async function createWorker(): Promise<WorkerLike | null> {
+  if (workerFactoryOverride !== null) {
+    return await workerFactoryOverride();
+  }
+
+  if (typeof Worker !== "function") {
+    return null;
+  }
+
+  const factoryModule = (await import("./worker_factory.js")) as {
+    createDefaultWorker(): WorkerLike;
+  };
+  return factoryModule.createDefaultWorker();
 }

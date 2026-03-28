@@ -17,8 +17,9 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "build:all": "npm run build:wasm && npm run build",
+    "build": "npm run build:wasm && npm run build:ts",
+    "build:all": "npm run build",
+    "build:ts": "tsc -p tsconfig.build.json",
     "build:wasm": "node ./scripts/build-wasm.mjs",
     "test": "jest --runInBand"
   },

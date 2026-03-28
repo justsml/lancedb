@@ -9,6 +9,7 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
+use futures::channel::oneshot;
 use futures::stream::{self, BoxStream, StreamExt};
 use http::header::{
     CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH,
@@ -17,11 +18,11 @@ use http::header::{
 use js_sys::{Function, Promise, Reflect, Uint8Array};
 use object_store::path::Path;
 use object_store::{
-    Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Headers, Request, RequestInit, Response};
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,73 @@ impl FetchHttpStore {
             .map_err(|source| js_error("awaiting fetch response", source))?
             .dyn_into::<Response>()
             .map_err(|source| js_error("casting fetch response", source))
+    }
+
+    async fn fetch_parts(
+        &self,
+        location: Path,
+        options: GetOptions,
+    ) -> object_store::Result<FetchParts> {
+        let response = self.fetch(&location, &options).await?;
+        let status = response.status();
+        let headers = response.headers();
+
+        match status {
+            404 => {
+                return Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: boxed("fetch returned 404"),
+                });
+            }
+            304 => {
+                return Err(object_store::Error::NotModified {
+                    path: location.to_string(),
+                    source: boxed("fetch returned 304"),
+                });
+            }
+            412 => {
+                return Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: boxed("fetch returned 412"),
+                });
+            }
+            200 | 206 => {}
+            _ => {
+                return Err(object_store::Error::Generic {
+                    store: "lancedb-wasm-fetch",
+                    source: boxed(format!("unexpected HTTP status {status} for {}", location)),
+                });
+            }
+        }
+
+        let (meta, range) = parse_meta(&location, &headers, &options, status)?;
+        let bytes = if options.head {
+            Bytes::new()
+        } else {
+            let buffer = JsFuture::from(
+                response
+                    .array_buffer()
+                    .map_err(|source| js_error("reading response arrayBuffer", source))?,
+            )
+            .await
+            .map_err(|source| js_error("awaiting response arrayBuffer", source))?;
+            Bytes::from(Uint8Array::new(&buffer).to_vec())
+        };
+
+        if !options.head && bytes.len() as u64 != range.end.saturating_sub(range.start) {
+            return Err(object_store::Error::Generic {
+                store: "lancedb-wasm-fetch",
+                source: boxed(format!(
+                    "response length {} did not match expected range {}..{} for {}",
+                    bytes.len(),
+                    range.start,
+                    range.end,
+                    location
+                )),
+            });
+        }
+
+        Ok(FetchParts { meta, range, bytes })
     }
 
     fn object_url(&self, location: &Path) -> object_store::Result<url::Url> {
@@ -148,64 +216,18 @@ impl ObjectStore for FetchHttpStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let response = self.fetch(location, &options).await?;
-        let status = response.status();
-        let headers = response.headers();
-
-        match status {
-            404 => {
-                return Err(object_store::Error::NotFound {
-                    path: location.to_string(),
-                    source: boxed("fetch returned 404"),
-                });
-            }
-            304 => {
-                return Err(object_store::Error::NotModified {
-                    path: location.to_string(),
-                    source: boxed("fetch returned 304"),
-                });
-            }
-            412 => {
-                return Err(object_store::Error::Precondition {
-                    path: location.to_string(),
-                    source: boxed("fetch returned 412"),
-                });
-            }
-            200 | 206 => {}
-            _ => {
-                return Err(object_store::Error::Generic {
-                    store: "lancedb-wasm-fetch",
-                    source: boxed(format!("unexpected HTTP status {status} for {}", location)),
-                });
-            }
-        }
-
-        let (meta, range) = parse_meta(location, &headers, &options, status)?;
-        let bytes = if options.head {
-            Bytes::new()
-        } else {
-            let buffer = JsFuture::from(
-                response
-                    .array_buffer()
-                    .map_err(|source| js_error("reading response arrayBuffer", source))?,
-            )
-            .await
-            .map_err(|source| js_error("awaiting response arrayBuffer", source))?;
-            Bytes::from(Uint8Array::new(&buffer).to_vec())
-        };
-
-        if !options.head && bytes.len() as u64 != range.end.saturating_sub(range.start) {
-            return Err(object_store::Error::Generic {
+        let store = self.clone();
+        let location = location.clone();
+        let (tx, rx) = oneshot::channel();
+        spawn_local(async move {
+            let result = store.fetch_parts(location, options).await;
+            let _ = tx.send(result);
+        });
+        let FetchParts { meta, range, bytes } =
+            rx.await.map_err(|_| object_store::Error::Generic {
                 store: "lancedb-wasm-fetch",
-                source: boxed(format!(
-                    "response length {} did not match expected range {}..{} for {}",
-                    bytes.len(),
-                    range.start,
-                    range.end,
-                    location
-                )),
-            });
-        }
+                source: boxed("fetch task was canceled"),
+            })??;
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
@@ -251,6 +273,12 @@ impl ObjectStore for FetchHttpStore {
             from, to
         )))
     }
+}
+
+struct FetchParts {
+    meta: ObjectMeta,
+    range: Range<u64>,
+    bytes: Bytes,
 }
 
 fn parse_meta(
