@@ -1,25 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance::dataset::{ReadParams, WriteParams};
-use lance_table::format::{IndexMetadata, Manifest, Transaction};
+use lance_table::format::{IndexMetadata, Manifest, RowIdMeta, Transaction};
 use lance_table::io::commit::{
     CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
     commit_handler_from_url,
 };
+use lance_table::io::deletion::relative_deletion_file_path;
 use lance_table::io::manifest::read_manifest;
 use log::warn;
 use object_store::ObjectMeta;
 use object_store::path::Path;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::utils::supported_vector_data_type;
 use crate::{Error, Result};
 
 pub(crate) const LATEST_MANIFEST_PATH: &str = "_latest.manifest";
+pub(crate) const LATEST_VERSION_PATH: &str = "_latest.version";
 pub(crate) const WEB_METADATA_PATH: &str = "_web.json";
+pub(crate) const SNAPSHOT_PATH: &str = "_snapshot.json";
+
+const WEB_METADATA_PREFIX: &str = "lancedb:web:";
+const MANIFEST_NAMING_SCHEME_KEY: &str = "lancedb:web:manifest_naming_scheme";
+const LATEST_MANIFEST_PATH_KEY: &str = "lancedb:web:latest_manifest_path";
+const LATEST_VERSION_PATH_KEY: &str = "lancedb:web:latest_version_path";
+const WEB_METADATA_PATH_KEY: &str = "lancedb:web:web_metadata_path";
+const SNAPSHOT_PATH_KEY: &str = "lancedb:web:snapshot_path";
+const DEFAULT_VECTOR_COLUMN_KEY: &str = "lancedb:web:default_vector_column";
+const VECTOR_COLUMNS_KEY: &str = "lancedb:web:vector_columns";
+const FTS_COLUMNS_KEY: &str = "lancedb:web:fts_columns";
 
 #[derive(Debug)]
 pub(crate) struct WebPublishCommitHandler {
@@ -32,13 +47,72 @@ impl WebPublishCommitHandler {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct WebSearchCapabilities {
+    default_vector_column: Option<String>,
+    vector_columns: Vec<String>,
+    fts_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct WebTableMetadata {
     version: u64,
     manifest_path: String,
     manifest_size_bytes: Option<u64>,
-    manifest_naming_scheme: &'static str,
+    manifest_naming_scheme: String,
+    latest_manifest_path: String,
+    latest_version_path: String,
+    web_metadata_path: String,
+    snapshot_path: String,
+    default_vector_column: Option<String>,
+    vector_columns: Vec<String>,
+    fts_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PublishedSnapshot {
+    version: u64,
+    manifest_path: String,
+    manifest_size_bytes: Option<u64>,
+    manifest_naming_scheme: String,
+    latest_manifest_path: String,
+    latest_version_path: String,
+    web_metadata_path: String,
+    snapshot_path: String,
+    default_vector_column: Option<String>,
+    vector_columns: Vec<String>,
+    fts_columns: Vec<String>,
+    is_complete: bool,
+    base_paths: Vec<PublishedBasePath>,
+    files: Vec<PublishedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PublishedBasePath {
+    id: u32,
+    name: Option<String>,
+    path: String,
+    is_dataset_root: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PublishedFile {
+    path: String,
+    kind: String,
+    size_bytes: Option<u64>,
+    base_id: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotPlan {
+    files: Vec<PublishedFile>,
+    base_paths: Vec<PublishedBasePath>,
+    is_complete: bool,
 }
 
 #[async_trait]
@@ -103,6 +177,10 @@ impl CommitHandler for WebPublishCommitHandler {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
+        let capabilities = collect_search_capabilities(manifest, indices.as_deref());
+        let snapshot_plan = build_snapshot_plan(manifest, indices.as_deref());
+        stamp_manifest_metadata(manifest, &capabilities, naming_scheme);
+
         let location = self
             .inner
             .commit(
@@ -116,7 +194,16 @@ impl CommitHandler for WebPublishCommitHandler {
             )
             .await?;
 
-        if let Err(source) = publish_sidecars(object_store, base_path, manifest, &location).await {
+        if let Err(source) = publish_sidecars(
+            object_store,
+            base_path,
+            manifest,
+            &location,
+            &capabilities,
+            &snapshot_plan,
+        )
+        .await
+        {
             warn!(
                 "Committed manifest {} but failed to update web publish sidecars: {}",
                 location.path, source
@@ -176,11 +263,213 @@ pub(crate) fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn Comm
     Arc::new(WebPublishCommitHandler::new(inner))
 }
 
+fn stamp_manifest_metadata(
+    manifest: &mut Manifest,
+    capabilities: &WebSearchCapabilities,
+    naming_scheme: ManifestNamingScheme,
+) {
+    let metadata = manifest.table_metadata_mut();
+    metadata.retain(|key, _| !key.starts_with(WEB_METADATA_PREFIX));
+    metadata.insert(
+        MANIFEST_NAMING_SCHEME_KEY.to_string(),
+        manifest_naming_scheme_name(naming_scheme).to_string(),
+    );
+    metadata.insert(
+        LATEST_MANIFEST_PATH_KEY.to_string(),
+        LATEST_MANIFEST_PATH.to_string(),
+    );
+    metadata.insert(
+        LATEST_VERSION_PATH_KEY.to_string(),
+        LATEST_VERSION_PATH.to_string(),
+    );
+    metadata.insert(
+        WEB_METADATA_PATH_KEY.to_string(),
+        WEB_METADATA_PATH.to_string(),
+    );
+    metadata.insert(SNAPSHOT_PATH_KEY.to_string(), SNAPSHOT_PATH.to_string());
+    metadata.insert(
+        VECTOR_COLUMNS_KEY.to_string(),
+        serde_json::to_string(&capabilities.vector_columns)
+            .expect("serializing vector column metadata should succeed"),
+    );
+    metadata.insert(
+        FTS_COLUMNS_KEY.to_string(),
+        serde_json::to_string(&capabilities.fts_columns)
+            .expect("serializing fts column metadata should succeed"),
+    );
+    if let Some(default_vector_column) = &capabilities.default_vector_column {
+        metadata.insert(
+            DEFAULT_VECTOR_COLUMN_KEY.to_string(),
+            default_vector_column.clone(),
+        );
+    }
+}
+
+fn collect_search_capabilities(
+    manifest: &Manifest,
+    indices: Option<&[IndexMetadata]>,
+) -> WebSearchCapabilities {
+    let vector_columns = collect_indexed_columns(manifest, indices, "VectorIndexDetails");
+    let fts_columns = collect_indexed_columns(manifest, indices, "InvertedIndexDetails");
+    let schema_vector_columns = manifest
+        .schema
+        .fields
+        .iter()
+        .filter(|field| supported_vector_data_type(&field.data_type()))
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+
+    let default_vector_column = if vector_columns.len() == 1 {
+        Some(vector_columns[0].clone())
+    } else if vector_columns.is_empty() && schema_vector_columns.len() == 1 {
+        Some(schema_vector_columns[0].clone())
+    } else {
+        None
+    };
+
+    WebSearchCapabilities {
+        default_vector_column,
+        vector_columns,
+        fts_columns,
+    }
+}
+
+fn collect_indexed_columns(
+    manifest: &Manifest,
+    indices: Option<&[IndexMetadata]>,
+    type_suffix: &str,
+) -> Vec<String> {
+    let mut columns = BTreeSet::new();
+    for index in indices.into_iter().flatten() {
+        let matches_type = index
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.ends_with(type_suffix))
+            .unwrap_or(false);
+        if !matches_type {
+            continue;
+        }
+        for field_id in &index.fields {
+            if let Some(field) = manifest.schema.field_by_id(*field_id) {
+                columns.insert(field.name.clone());
+            }
+        }
+    }
+    columns.into_iter().collect()
+}
+
+fn build_snapshot_plan(manifest: &Manifest, indices: Option<&[IndexMetadata]>) -> SnapshotPlan {
+    let mut files = Vec::new();
+    for fragment in manifest.fragments.iter() {
+        for data_file in &fragment.files {
+            push_snapshot_file(
+                &mut files,
+                PublishedFile {
+                    path: data_file.path.clone(),
+                    kind: "data".to_string(),
+                    size_bytes: data_file.file_size_bytes.get().map(|size| size.get()),
+                    base_id: data_file.base_id,
+                },
+            );
+        }
+        if let Some(deletion_file) = &fragment.deletion_file {
+            push_snapshot_file(
+                &mut files,
+                PublishedFile {
+                    path: relative_deletion_file_path(fragment.id, deletion_file),
+                    kind: "deletion".to_string(),
+                    size_bytes: None,
+                    base_id: deletion_file.base_id,
+                },
+            );
+        }
+        if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
+            push_snapshot_file(
+                &mut files,
+                PublishedFile {
+                    path: external_file.path.clone(),
+                    kind: "rowIds".to_string(),
+                    size_bytes: Some(external_file.size),
+                    base_id: None,
+                },
+            );
+        }
+    }
+
+    let mut is_complete = true;
+    for index in indices.into_iter().flatten() {
+        let Some(index_files) = &index.files else {
+            is_complete = false;
+            continue;
+        };
+        for file in index_files {
+            push_snapshot_file(
+                &mut files,
+                PublishedFile {
+                    path: format!("_indices/{}/{}", index.uuid, file.path),
+                    kind: "index".to_string(),
+                    size_bytes: Some(file.size_bytes),
+                    base_id: index.base_id,
+                },
+            );
+        }
+    }
+
+    if let Some(transaction_file) = &manifest.transaction_file
+        && !transaction_file.is_empty()
+    {
+        push_snapshot_file(
+            &mut files,
+            PublishedFile {
+                path: transaction_file.clone(),
+                kind: "transaction".to_string(),
+                size_bytes: None,
+                base_id: None,
+            },
+        );
+    }
+
+    files.sort_by(|left, right| {
+        (&left.base_id, &left.kind, &left.path).cmp(&(&right.base_id, &right.kind, &right.path))
+    });
+
+    let mut base_paths = manifest
+        .base_paths
+        .values()
+        .map(|base_path| PublishedBasePath {
+            id: base_path.id,
+            name: base_path.name.clone(),
+            path: base_path.path.clone(),
+            is_dataset_root: base_path.is_dataset_root,
+        })
+        .collect::<Vec<_>>();
+    base_paths.sort_by_key(|base_path| base_path.id);
+
+    SnapshotPlan {
+        files,
+        base_paths,
+        is_complete,
+    }
+}
+
+fn push_snapshot_file(files: &mut Vec<PublishedFile>, file: PublishedFile) {
+    let already_present = files.iter().any(|candidate| {
+        candidate.path == file.path
+            && candidate.kind == file.kind
+            && candidate.base_id == file.base_id
+    });
+    if !already_present {
+        files.push(file);
+    }
+}
+
 async fn publish_sidecars(
     object_store: &lance_io::object_store::ObjectStore,
     base_path: &Path,
     manifest: &Manifest,
     manifest_location: &ManifestLocation,
+    capabilities: &WebSearchCapabilities,
+    snapshot_plan: &SnapshotPlan,
 ) -> Result<()> {
     let manifest_bytes = object_store
         .inner
@@ -189,6 +478,89 @@ async fn publish_sidecars(
         .bytes()
         .await?;
 
+    let latest_version_bytes = manifest.version.to_string().into_bytes();
+    let metadata = WebTableMetadata {
+        version: manifest.version,
+        manifest_path: manifest_location.path.to_string(),
+        manifest_size_bytes: manifest_location.size,
+        manifest_naming_scheme: manifest_naming_scheme_name(manifest_location.naming_scheme)
+            .to_string(),
+        latest_manifest_path: LATEST_MANIFEST_PATH.to_string(),
+        latest_version_path: LATEST_VERSION_PATH.to_string(),
+        web_metadata_path: WEB_METADATA_PATH.to_string(),
+        snapshot_path: SNAPSHOT_PATH.to_string(),
+        default_vector_column: capabilities.default_vector_column.clone(),
+        vector_columns: capabilities.vector_columns.clone(),
+        fts_columns: capabilities.fts_columns.clone(),
+    };
+    let metadata_json = serde_json::to_vec_pretty(&metadata).map_err(|source| Error::Runtime {
+        message: format!("failed to serialize web table metadata: {source}"),
+    })?;
+
+    let mut snapshot_files = snapshot_plan.files.clone();
+    push_snapshot_file(
+        &mut snapshot_files,
+        PublishedFile {
+            path: manifest_location.path.to_string(),
+            kind: "manifest".to_string(),
+            size_bytes: manifest_location
+                .size
+                .or_else(|| u64::try_from(manifest_bytes.len()).ok()),
+            base_id: None,
+        },
+    );
+    push_snapshot_file(
+        &mut snapshot_files,
+        PublishedFile {
+            path: LATEST_MANIFEST_PATH.to_string(),
+            kind: "latestManifest".to_string(),
+            size_bytes: u64::try_from(manifest_bytes.len()).ok(),
+            base_id: None,
+        },
+    );
+    push_snapshot_file(
+        &mut snapshot_files,
+        PublishedFile {
+            path: LATEST_VERSION_PATH.to_string(),
+            kind: "latestVersion".to_string(),
+            size_bytes: u64::try_from(latest_version_bytes.len()).ok(),
+            base_id: None,
+        },
+    );
+    push_snapshot_file(
+        &mut snapshot_files,
+        PublishedFile {
+            path: WEB_METADATA_PATH.to_string(),
+            kind: "webMetadata".to_string(),
+            size_bytes: u64::try_from(metadata_json.len()).ok(),
+            base_id: None,
+        },
+    );
+    snapshot_files.sort_by(|left, right| {
+        (&left.base_id, &left.kind, &left.path).cmp(&(&right.base_id, &right.kind, &right.path))
+    });
+
+    let snapshot = PublishedSnapshot {
+        version: manifest.version,
+        manifest_path: manifest_location.path.to_string(),
+        manifest_size_bytes: manifest_location.size,
+        manifest_naming_scheme: manifest_naming_scheme_name(manifest_location.naming_scheme)
+            .to_string(),
+        latest_manifest_path: LATEST_MANIFEST_PATH.to_string(),
+        latest_version_path: LATEST_VERSION_PATH.to_string(),
+        web_metadata_path: WEB_METADATA_PATH.to_string(),
+        snapshot_path: SNAPSHOT_PATH.to_string(),
+        default_vector_column: capabilities.default_vector_column.clone(),
+        vector_columns: capabilities.vector_columns.clone(),
+        fts_columns: capabilities.fts_columns.clone(),
+        is_complete: snapshot_plan.is_complete,
+        base_paths: snapshot_plan.base_paths.clone(),
+        files: snapshot_files,
+    };
+    let snapshot_json = serde_json::to_vec_pretty(&snapshot).map_err(|source| Error::Runtime {
+        message: format!("failed to serialize published snapshot manifest: {source}"),
+    })?;
+
     object_store
         .inner
         .put(
@@ -196,19 +568,20 @@ async fn publish_sidecars(
             manifest_bytes.into(),
         )
         .await?;
-
-    let metadata = WebTableMetadata {
-        version: manifest.version,
-        manifest_path: manifest_location.path.to_string(),
-        manifest_size_bytes: manifest_location.size,
-        manifest_naming_scheme: manifest_naming_scheme_name(manifest_location.naming_scheme),
-    };
-    let metadata_json = serde_json::to_vec_pretty(&metadata).map_err(|source| Error::Runtime {
-        message: format!("failed to serialize web table metadata: {source}"),
-    })?;
+    object_store
+        .inner
+        .put(
+            &base_path.child(LATEST_VERSION_PATH),
+            latest_version_bytes.into(),
+        )
+        .await?;
     object_store
         .inner
         .put(&base_path.child(WEB_METADATA_PATH), metadata_json.into())
+        .await?;
+    object_store
+        .inner
+        .put(&base_path.child(SNAPSHOT_PATH), snapshot_json.into())
         .await?;
 
     Ok(())
@@ -241,29 +614,71 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
+    };
+    use arrow_data::ArrayDataBuilder;
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
     use crate::connect;
+    use crate::index::Index;
     use crate::table::{BaseTable, NativeTable};
 
-    use super::{LATEST_MANIFEST_PATH, WEB_METADATA_PATH};
-
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct WebTableMetadata {
-        version: u64,
-        manifest_path: String,
-        manifest_size_bytes: Option<u64>,
-        manifest_naming_scheme: String,
-    }
+    use super::{
+        DEFAULT_VECTOR_COLUMN_KEY, FTS_COLUMNS_KEY, LATEST_MANIFEST_PATH, LATEST_VERSION_PATH,
+        MANIFEST_NAMING_SCHEME_KEY, PublishedSnapshot, SNAPSHOT_PATH, VECTOR_COLUMNS_KEY,
+        WEB_METADATA_PATH, WebTableMetadata,
+    };
 
     fn make_batch(start: i32, len: i32) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         RecordBatch::try_new(
             schema,
             vec![Arc::new(Int32Array::from_iter_values(start..(start + len)))],
+        )
+        .unwrap()
+    }
+
+    fn make_vectors(start: usize, rows: usize, dimension: i32) -> FixedSizeListArray {
+        let values = Float32Array::from_iter_values(
+            (start..(start + rows * dimension as usize)).map(|value| value as f32),
+        );
+        let list_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dimension,
+        );
+        let data = ArrayDataBuilder::new(list_type)
+            .len(rows)
+            .add_child_data(values.into_data())
+            .build()
+            .unwrap();
+        FixedSizeListArray::from(data)
+    }
+
+    fn make_search_batch(rows: usize) -> RecordBatch {
+        let dimension = 8;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+        ]));
+        let text =
+            StringArray::from_iter_values((0..rows).map(|row| ["cat", "dog", "fish"][row % 3]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..rows as i32)),
+                Arc::new(text),
+                Arc::new(make_vectors(0, rows, dimension)),
+            ],
         )
         .unwrap()
     }
@@ -288,10 +703,14 @@ mod tests {
 
         let root = table_root(dir.path());
         let latest_manifest = root.join(LATEST_MANIFEST_PATH);
+        let latest_version = root.join(LATEST_VERSION_PATH);
         let web_metadata = root.join(WEB_METADATA_PATH);
+        let snapshot_path = root.join(SNAPSHOT_PATH);
 
         assert!(latest_manifest.exists());
+        assert!(latest_version.exists());
         assert!(web_metadata.exists());
+        assert!(snapshot_path.exists());
 
         let initial_metadata: WebTableMetadata =
             serde_json::from_slice(&fs::read(&web_metadata).unwrap()).unwrap();
@@ -299,6 +718,9 @@ mod tests {
         assert!(initial_metadata.manifest_path.contains("_versions/"));
         assert!(initial_metadata.manifest_size_bytes.is_some());
         assert_eq!(initial_metadata.manifest_naming_scheme, "v2");
+        assert_eq!(initial_metadata.latest_manifest_path, LATEST_MANIFEST_PATH);
+        assert_eq!(initial_metadata.latest_version_path, LATEST_VERSION_PATH);
+        assert_eq!(fs::read_to_string(&latest_version).unwrap(), "1");
 
         table.add(make_batch(10, 2)).execute().await.unwrap();
 
@@ -306,6 +728,98 @@ mod tests {
             serde_json::from_slice(&fs::read(&web_metadata).unwrap()).unwrap();
         assert_eq!(updated_metadata.version, 2);
         assert!(updated_metadata.manifest_path.contains("_versions/"));
+        assert_eq!(fs::read_to_string(&latest_version).unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn writes_publish_metadata_for_searchable_table() {
+        let dir = tempdir().unwrap();
+        let db = connect(dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        let table = db
+            .create_table("published", make_search_batch(256))
+            .execute()
+            .await
+            .unwrap();
+        table
+            .create_index(&["text"], Index::FTS(Default::default()))
+            .execute()
+            .await
+            .unwrap();
+        table
+            .create_index(&["vector"], Index::Auto)
+            .execute()
+            .await
+            .unwrap();
+        table.delete("id = 0").await.unwrap();
+
+        let root = table_root(dir.path());
+        let metadata: WebTableMetadata =
+            serde_json::from_slice(&fs::read(root.join(WEB_METADATA_PATH)).unwrap()).unwrap();
+        let snapshot: PublishedSnapshot =
+            serde_json::from_slice(&fs::read(root.join(SNAPSHOT_PATH)).unwrap()).unwrap();
+        let manifest = table.as_native().unwrap().manifest().await.unwrap();
+
+        assert_eq!(metadata.default_vector_column.as_deref(), Some("vector"));
+        assert_eq!(metadata.vector_columns, vec!["vector".to_string()]);
+        assert_eq!(metadata.fts_columns, vec!["text".to_string()]);
+        assert_eq!(snapshot.default_vector_column.as_deref(), Some("vector"));
+        assert_eq!(snapshot.vector_columns, vec!["vector".to_string()]);
+        assert_eq!(snapshot.fts_columns, vec!["text".to_string()]);
+        assert!(snapshot.is_complete);
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.kind == "manifest" && file.path == metadata.manifest_path)
+        );
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.kind == "latestManifest" && file.path == LATEST_MANIFEST_PATH)
+        );
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.kind == "latestVersion" && file.path == LATEST_VERSION_PATH)
+        );
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.kind == "webMetadata" && file.path == WEB_METADATA_PATH)
+        );
+        assert!(snapshot.files.iter().any(|file| file.kind == "data"));
+        assert!(snapshot.files.iter().any(|file| file.kind == "index"));
+        assert!(snapshot.files.iter().any(|file| file.kind == "deletion"));
+
+        assert_eq!(
+            manifest.table_metadata.get(MANIFEST_NAMING_SCHEME_KEY),
+            Some(&"v2".to_string())
+        );
+        assert_eq!(
+            manifest.table_metadata.get(DEFAULT_VECTOR_COLUMN_KEY),
+            Some(&"vector".to_string())
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(
+                manifest.table_metadata.get(VECTOR_COLUMNS_KEY).unwrap()
+            )
+            .unwrap(),
+            vec!["vector".to_string()]
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(
+                manifest.table_metadata.get(FTS_COLUMNS_KEY).unwrap()
+            )
+            .unwrap(),
+            vec!["text".to_string()]
+        );
     }
 
     #[tokio::test]
