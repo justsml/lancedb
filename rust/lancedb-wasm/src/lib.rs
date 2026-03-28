@@ -62,6 +62,8 @@ use wasm_bindgen::prelude::*;
 use lance_index::scalar::FullTextSearchQuery;
 #[cfg(any(target_arch = "wasm32", test))]
 mod browser;
+#[cfg(any(target_arch = "wasm32", test))]
+mod browser_expr;
 #[cfg(target_arch = "wasm32")]
 use browser::BrowserTable;
 
@@ -71,6 +73,8 @@ mod local_error {
 
     use arrow_schema::ArrowError;
     use lance_core::Error as LanceError;
+    #[cfg(not(target_arch = "wasm32"))]
+    use lancedb::Error as NativeError;
 
     pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
     pub type Result<T> = std::result::Result<T, Error>;
@@ -155,6 +159,16 @@ mod local_error {
     impl From<ArrowError> for Error {
         fn from(source: ArrowError) -> Self {
             Self::Arrow { source }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl From<NativeError> for Error {
+        fn from(source: NativeError) -> Self {
+            Self::Other {
+                message: source.to_string(),
+                source: Some(Box::new(source)),
+            }
         }
     }
 }
