@@ -6,6 +6,7 @@
 //! This module contains the implementation of optimization operations that help
 //! maintain good performance for LanceDB tables.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lance::dataset::cleanup::RemovalStats;
@@ -87,6 +88,19 @@ pub enum OptimizeAction {
     /// For example, when using IVF, an index will create clusters.  Optimizing an index assigns unindexed
     /// data to the existing clusters, but it does not move the clusters or create new clusters.
     Index(OptimizeOptions),
+    /// Compact index segments to favor search latency over indexing throughput.
+    ///
+    /// This is a search-oriented mode. Unlike [`OptimizeAction::Index`], which is a good
+    /// default for incrementally keeping indices up to date as new data arrives, this mode
+    /// merges as many existing index segments as the table currently has and produces a more
+    /// compact search-time layout.
+    ///
+    /// Use this when you are preparing a table for read-heavy serving, static publishing, or
+    /// browser / edge delivery and you want searches to touch as few index segments as possible.
+    ///
+    /// This mode does not retrain the index. It compacts existing index state for better search
+    /// execution instead of optimizing indexing throughput.
+    IndexCompact(OptimizeOptions),
 }
 
 /// Statistics about the optimization.
@@ -109,6 +123,38 @@ pub(crate) async fn optimize_indices(table: &NativeTable, options: &OptimizeOpti
     dataset.optimize_indices(options).await?;
     table.dataset.update(dataset);
     Ok(())
+}
+
+async fn search_compact_index_options(
+    table: &NativeTable,
+    options: &OptimizeOptions,
+) -> Result<OptimizeOptions> {
+    if options.num_indices_to_merge.is_some() && !options.retrain {
+        return Ok(options.clone());
+    }
+
+    let dataset = table.dataset.get().await?;
+    let selected_index_names = options
+        .index_names
+        .as_ref()
+        .map(|names| names.iter().cloned().collect::<HashSet<_>>());
+
+    let mut counts = HashMap::<String, usize>::new();
+    for index in dataset.load_indices().await?.iter() {
+        if selected_index_names
+            .as_ref()
+            .is_none_or(|names| names.contains(&index.name))
+        {
+            *counts.entry(index.name.clone()).or_default() += 1;
+        }
+    }
+
+    let num_indices_to_merge = counts.into_values().max().unwrap_or(1);
+    let mut compact_options = options
+        .clone()
+        .num_indices_to_merge(Some(num_indices_to_merge));
+    compact_options.retrain = false;
+    Ok(compact_options)
 }
 
 /// Remove old versions of the dataset from disk.
@@ -208,13 +254,20 @@ pub(crate) async fn execute_optimize(
         OptimizeAction::Index(options) => {
             optimize_indices(table, &options).await?;
         }
+        OptimizeAction::IndexCompact(options) => {
+            let compact_options = search_compact_index_options(table, &options).await?;
+            optimize_indices(table, &compact_options).await?;
+        }
     }
     Ok(stats)
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
+    };
+    use arrow_data::ArrayDataBuilder;
     use arrow_schema::{DataType, Field, Schema};
     use rstest::rstest;
     use std::sync::Arc;
@@ -224,6 +277,7 @@ mod tests {
     use crate::query::ExecutableQuery;
     use crate::table::{CompactionOptions, OptimizeAction, OptimizeStats};
     use futures::TryStreamExt;
+    use lance_index::optimize::OptimizeOptions;
 
     #[tokio::test]
     async fn test_optimize_compact_simple() {
@@ -440,6 +494,89 @@ mod tests {
         // Verify data integrity
         let final_row_count = table.count_rows(None).await.unwrap();
         assert_eq!(final_row_count, 200);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_index_compact_for_search() {
+        let conn = connect("memory://").execute().await.unwrap();
+
+        let dimension = 8;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(make_vectors(0, 256, dimension))],
+        )
+        .unwrap();
+
+        let table = conn
+            .create_table("test_index_compact", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        table
+            .create_index(&["vector"], Index::Auto)
+            .execute()
+            .await
+            .unwrap();
+
+        let index_name = table.list_indices().await.unwrap()[0].name.clone();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(make_vectors(10_000, 256, dimension))],
+        )
+        .unwrap();
+        table.add(batch).execute().await.unwrap();
+        table
+            .optimize(OptimizeAction::Index(OptimizeOptions::append()))
+            .await
+            .unwrap();
+
+        let stats_before = table.index_stats(&index_name).await.unwrap().unwrap();
+        assert_eq!(stats_before.num_indices, Some(2));
+        assert_eq!(stats_before.num_indexed_rows, 512);
+        assert_eq!(stats_before.num_unindexed_rows, 0);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(make_vectors(20_000, 256, dimension))],
+        )
+        .unwrap();
+        table.add(batch).execute().await.unwrap();
+
+        table
+            .optimize(OptimizeAction::IndexCompact(Default::default()))
+            .await
+            .unwrap();
+
+        let stats_after = table.index_stats(&index_name).await.unwrap().unwrap();
+        assert_eq!(stats_after.num_indexed_rows, 768);
+        assert_eq!(stats_after.num_unindexed_rows, 0);
+        assert_eq!(stats_after.num_indices, Some(1));
+    }
+
+    fn make_vectors(start: usize, rows: usize, dimension: i32) -> FixedSizeListArray {
+        let values = Float32Array::from_iter_values(
+            (start..(start + rows * dimension as usize)).map(|value| value as f32),
+        );
+        let list_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dimension,
+        );
+        let data = ArrayDataBuilder::new(list_type)
+            .len(rows)
+            .add_child_data(values.into_data())
+            .build()
+            .unwrap();
+        FixedSizeListArray::from(data)
     }
 
     #[tokio::test]
@@ -697,6 +834,7 @@ mod tests {
         error_if_tagged_old_versions: None,
     })]
     #[case::index(OptimizeAction::Index(Default::default()))]
+    #[case::index_compact(OptimizeAction::IndexCompact(Default::default()))]
     #[tokio::test]
     async fn test_optimize_fails_on_checked_out_table(#[case] action: OptimizeAction) {
         let conn = connect("memory://").execute().await.unwrap();

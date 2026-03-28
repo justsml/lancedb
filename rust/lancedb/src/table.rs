@@ -983,6 +983,7 @@ impl Table {
     ///  * Compaction: Merges small files into larger ones
     ///  * Prune: Removes old versions of the dataset
     ///  * Index: Optimizes the indices, adding new data to existing indices
+    ///  * IndexCompact: Compacts index segments to favor search latency for read-heavy serving
     ///
     /// The frequency an application should call optimize is based on the frequency of
     /// data modifications.  If data is frequently added, deleted, or updated then
