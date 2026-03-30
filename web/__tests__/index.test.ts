@@ -163,6 +163,8 @@ describe("@lancedb/lancedb-web", () => {
   });
 
   it("uses a worker backend when available", async () => {
+    jest.spyOn(globalThis, "fetch").mockImplementation(successfulFetch());
+
     const directOpenMock = jest.fn<
       Promise<WasmRemoteSearchHandle>,
       [string, string | undefined]
@@ -175,9 +177,7 @@ describe("@lancedb/lancedb-web", () => {
     const worker = makeWorker(handle);
     __setWorkerFactoryForTests(() => worker);
 
-    const table = await openTable("https://example.com/search_table.lance", {
-      fetch: successfulFetch(),
-    });
+    const table = await openTable("https://example.com/search_table.lance");
     const schema = await table.schema();
     const results = await table.search({
       vector: new Float32Array([0, 1]),
@@ -199,6 +199,8 @@ describe("@lancedb/lancedb-web", () => {
   });
 
   it("falls back to the direct runtime when worker init fails", async () => {
+    jest.spyOn(globalThis, "fetch").mockImplementation(successfulFetch());
+
     const handle = makeHandle();
     const openTableMock = jest.fn<
       Promise<WasmRemoteSearchHandle>,
@@ -209,12 +211,30 @@ describe("@lancedb/lancedb-web", () => {
     }));
     __setWorkerFactoryForTests(() => makeWorker(makeHandle(), { failOpen: true }));
 
-    const table = await openTable("https://example.com/search_table.lance", {
-      fetch: successfulFetch(),
-    });
+    const table = await openTable("https://example.com/search_table.lance");
     await table.search({
       vector: new Float32Array([0, 1]),
     });
+
+    expect(openTableMock).toHaveBeenCalledTimes(1);
+    expect(handle.search).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the direct runtime when a custom fetch is supplied", async () => {
+    const handle = makeHandle();
+    const openTableMock = jest.fn<
+      Promise<WasmRemoteSearchHandle>,
+      [string, string | undefined]
+    >(async () => handle);
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: openTableMock,
+    }));
+    __setWorkerFactoryForTests(() => makeWorker(makeHandle()));
+
+    const table = await openTable("https://example.com/search_table.lance", {
+      fetch: successfulFetch(),
+    });
+    await table.search({ vector: new Float32Array([0, 1]) });
 
     expect(openTableMock).toHaveBeenCalledTimes(1);
     expect(handle.search).toHaveBeenCalledTimes(1);
@@ -258,6 +278,36 @@ describe("@lancedb/lancedb-web", () => {
     expect(secondHandle.close).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the existing handle when reopen fails", async () => {
+    const firstHandle = makeHandle();
+    const openTableMock = jest
+      .fn<Promise<WasmRemoteSearchHandle>, [string, string | undefined]>()
+      .mockResolvedValueOnce(firstHandle)
+      .mockRejectedValueOnce(new Error("reopen failed"));
+
+    let headerValue = "token-a";
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: openTableMock,
+    }));
+
+    const table = await openTable("https://example.com/search_table.lance", {
+      fetch: successfulFetch(),
+      headers: async () => ({ Authorization: headerValue }),
+      noWorker: true,
+    });
+
+    headerValue = "token-b";
+    await expect(table.search({ vector: new Float32Array([0, 1]) })).rejects.toThrow(
+      /reopen failed/,
+    );
+
+    headerValue = "token-a";
+    await table.search({ vector: new Float32Array([0, 1]) });
+
+    expect(firstHandle.search).toHaveBeenCalledTimes(1);
+    expect(firstHandle.close).not.toHaveBeenCalled();
+  });
+
   it("uses _latest.version to skip reopening when the snapshot is unchanged", async () => {
     const handle = makeHandle();
     const openTableMock = jest.fn<
@@ -278,6 +328,24 @@ describe("@lancedb/lancedb-web", () => {
     expect(await table.refresh()).toBe(false);
     expect(handle.refresh).not.toHaveBeenCalled();
     expect(openTableMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not apply the worker init timeout to search requests", async () => {
+    jest.spyOn(globalThis, "fetch").mockImplementation(successfulFetch());
+
+    const handle = makeHandle();
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: async () => handle,
+    }));
+    __setWorkerFactoryForTests(() => makeWorker(handle, { searchDelayMs: 20 }));
+
+    const table = await openTable("https://example.com/search_table.lance", {
+      workerInitTimeoutMs: 1,
+    });
+
+    await expect(
+      table.search({ vector: new Float32Array([0, 1]) }),
+    ).resolves.toHaveProperty("numRows", 2);
   });
 
   it("fails fast when published metadata advertises no FTS index", async () => {
@@ -354,7 +422,7 @@ function sidecarFetch({
 
 function makeWorker(
   handle: jest.Mocked<WasmRemoteSearchHandle>,
-  options: { failOpen?: boolean } = {},
+  options: { failOpen?: boolean; searchDelayMs?: number } = {},
 ) {
   const messageListeners = new Set<
     (event: MessageEvent<WorkerResponse>) => void
@@ -431,6 +499,9 @@ function makeWorker(
               return;
             }
             case "search": {
+              if (options.searchDelayMs !== undefined) {
+                await new Promise((resolve) => setTimeout(resolve, options.searchDelayMs));
+              }
               const bytes = await handle.search(request.requestJson);
               emitMessage({
                 id: request.id,

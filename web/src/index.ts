@@ -17,6 +17,7 @@ export interface OpenTableOptions {
   manifestUrl?: string;
   noWorker?: boolean;
   workerInitTimeoutMs?: number;
+  workerRequestTimeoutMs?: number;
 }
 
 export type HeaderProvider =
@@ -25,11 +26,14 @@ export type HeaderProvider =
 
 export type TextQuery = string | { query: string; columns?: string[] };
 
+export type DistanceType = "l2" | "cosine" | "dot" | "hamming";
+
 export type Selection = string[] | Record<string, string>;
 
 export interface SearchRequest {
   vector?: Float32Array | number[];
   text?: TextQuery;
+  distanceType?: DistanceType;
   filter?: string;
   select?: Selection;
   limit?: number;
@@ -49,7 +53,7 @@ export interface RemoteSearchTable {
 
 type OpenOptionsPayload = Omit<
   OpenTableOptions,
-  "fetch" | "headers" | "noWorker" | "workerInitTimeoutMs"
+  "fetch" | "headers" | "noWorker" | "workerInitTimeoutMs" | "workerRequestTimeoutMs"
 > & {
   headers?: Record<string, string>;
   latestVersionUrl?: string;
@@ -125,32 +129,82 @@ const DEFAULT_WORKER_INIT_TIMEOUT_MS = 10_000;
 let wasmModuleLoader: () => Promise<WasmModule> = async () =>
   (await import("./generated/lancedb_wasm.js")) as WasmModule;
 let workerFactoryOverride: WorkerFactory | null = null;
+let fetchOverrideQueue = Promise.resolve();
+
+function usesCustomFetch(fetchFn: typeof globalThis.fetch | undefined): boolean {
+  return fetchFn !== undefined && fetchFn !== globalThis.fetch;
+}
+
+async function withFetchOverride<T>(
+  fetchFn: typeof globalThis.fetch | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (!usesCustomFetch(fetchFn)) {
+    return await operation();
+  }
+
+  const root = globalThis as typeof globalThis & {
+    fetch?: typeof globalThis.fetch;
+  };
+  const run = fetchOverrideQueue.then(async () => {
+    const previousFetch = root.fetch;
+    root.fetch = fetchFn!;
+    try {
+      return await operation();
+    } finally {
+      if (previousFetch === undefined) {
+        Reflect.deleteProperty(root, "fetch");
+      } else {
+        root.fetch = previousFetch;
+      }
+    }
+  });
+  fetchOverrideQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return await run;
+}
 
 class DirectHandleBackend implements HandleBackend {
   static async open(
     tableUrl: string,
     optionsJson?: string,
+    fetchOverride?: typeof globalThis.fetch,
   ): Promise<DirectHandleBackend> {
-    const wasmModule = await wasmModuleLoader();
-    return new DirectHandleBackend(await wasmModule.open_table(tableUrl, optionsJson));
+    return await withFetchOverride(fetchOverride, async () => {
+      const wasmModule = await wasmModuleLoader();
+      return new DirectHandleBackend(
+        await wasmModule.open_table(tableUrl, optionsJson),
+        fetchOverride,
+      );
+    });
   }
 
   readonly #handle: WasmRemoteSearchHandle;
+  readonly #fetchOverride?: typeof globalThis.fetch;
 
-  private constructor(handle: WasmRemoteSearchHandle) {
+  private constructor(
+    handle: WasmRemoteSearchHandle,
+    fetchOverride?: typeof globalThis.fetch,
+  ) {
     this.#handle = handle;
+    this.#fetchOverride = fetchOverride;
   }
 
   schema(): Promise<Uint8Array> {
-    return this.#handle.schema();
+    return withFetchOverride(this.#fetchOverride, async () => await this.#handle.schema());
   }
 
   search(requestJson: string): Promise<Uint8Array> {
-    return this.#handle.search(requestJson);
+    return withFetchOverride(
+      this.#fetchOverride,
+      async () => await this.#handle.search(requestJson),
+    );
   }
 
   refresh(): Promise<boolean> {
-    return this.#handle.refresh();
+    return withFetchOverride(this.#fetchOverride, async () => await this.#handle.refresh());
   }
 
   close(): void {
@@ -162,14 +216,15 @@ class WorkerHandleBackend implements HandleBackend {
   static async open(
     tableUrl: string,
     optionsJson: string | undefined,
-    timeoutMs: number,
+    initTimeoutMs: number,
+    requestTimeoutMs?: number,
   ): Promise<WorkerHandleBackend> {
     const worker = await createWorker();
     if (worker === null) {
       throw new Error("Workers are not available in this runtime.");
     }
 
-    const backend = new WorkerHandleBackend(worker);
+    const backend = new WorkerHandleBackend(worker, requestTimeoutMs);
     try {
       const response = await backend.#request(
         {
@@ -178,7 +233,7 @@ class WorkerHandleBackend implements HandleBackend {
           tableUrl,
           optionsJson,
         },
-        timeoutMs,
+        initTimeoutMs,
       );
       if (response.type !== "open") {
         throw new Error(`Unexpected worker response type "${response.type}"`);
@@ -194,18 +249,20 @@ class WorkerHandleBackend implements HandleBackend {
   readonly #pending = new Map<
     number,
     {
-      timeout: ReturnType<typeof setTimeout>;
+      timeout: ReturnType<typeof setTimeout> | null;
       resolve: (response: WorkerSuccessResponse) => void;
       reject: (reason?: unknown) => void;
     }
   >();
   readonly #onMessage: (event: MessageEvent<WorkerResponse>) => void;
   readonly #onError: (event: ErrorEvent) => void;
+  readonly #requestTimeoutMs: number | null;
   #closed = false;
   #nextRequestId = 1;
 
-  private constructor(worker: WorkerLike) {
+  private constructor(worker: WorkerLike, requestTimeoutMs?: number) {
     this.#worker = worker;
+    this.#requestTimeoutMs = requestTimeoutMs ?? null;
     this.#onMessage = (event) => {
       const response = event.data;
       const pending = this.#pending.get(response.id);
@@ -213,7 +270,9 @@ class WorkerHandleBackend implements HandleBackend {
         return;
       }
 
-      clearTimeout(pending.timeout);
+      if (pending.timeout !== null) {
+        clearTimeout(pending.timeout);
+      }
       this.#pending.delete(response.id);
       if (!response.ok) {
         pending.reject(new Error(response.error));
@@ -239,7 +298,7 @@ class WorkerHandleBackend implements HandleBackend {
     const response = await this.#request({
       id: this.#nextId(),
       type: "schema",
-    });
+    }, this.#requestTimeoutMs);
     if (response.type !== "schema") {
       throw new Error(`Unexpected worker response type "${response.type}"`);
     }
@@ -251,7 +310,7 @@ class WorkerHandleBackend implements HandleBackend {
       id: this.#nextId(),
       type: "search",
       requestJson,
-    });
+    }, this.#requestTimeoutMs);
     if (response.type !== "search") {
       throw new Error(`Unexpected worker response type "${response.type}"`);
     }
@@ -262,7 +321,7 @@ class WorkerHandleBackend implements HandleBackend {
     const response = await this.#request({
       id: this.#nextId(),
       type: "refresh",
-    });
+    }, this.#requestTimeoutMs);
     if (response.type !== "refresh") {
       throw new Error(`Unexpected worker response type "${response.type}"`);
     }
@@ -287,21 +346,24 @@ class WorkerHandleBackend implements HandleBackend {
 
   async #request(
     request: WorkerRequest,
-    timeoutMs = DEFAULT_WORKER_INIT_TIMEOUT_MS,
+    timeoutMs: number | null = DEFAULT_WORKER_INIT_TIMEOUT_MS,
   ): Promise<WorkerSuccessResponse> {
     if (this.#closed) {
       throw new Error("Remote search worker is closed");
     }
 
     return await new Promise<WorkerSuccessResponse>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.#pending.delete(request.id);
-        reject(
-          new Error(
-            `Remote search worker request "${request.type}" timed out after ${timeoutMs}ms.`,
-          ),
-        );
-      }, timeoutMs);
+      const timeout =
+        timeoutMs === null
+          ? null
+          : setTimeout(() => {
+              this.#pending.delete(request.id);
+              reject(
+                new Error(
+                  `Remote search worker request "${request.type}" timed out after ${timeoutMs}ms.`,
+                ),
+              );
+            }, timeoutMs);
 
       this.#pending.set(request.id, { timeout, resolve, reject });
       this.#worker.postMessage(request);
@@ -310,7 +372,9 @@ class WorkerHandleBackend implements HandleBackend {
 
   #rejectPending(error: Error): void {
     for (const { timeout, reject } of this.#pending.values()) {
-      clearTimeout(timeout);
+      if (timeout !== null) {
+        clearTimeout(timeout);
+      }
       reject(error);
     }
     this.#pending.clear();
@@ -467,16 +531,18 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
       this.#options,
     );
     await preflightOpen(published.manifestUrl, resolvedHeaders, this.#options);
-    this.#handle!.close();
-    this.#handle = await openHandleBackend(
+    const currentHandle = this.#handle!;
+    const nextHandle = await openHandleBackend(
       this.#tableUrl,
       JSON.stringify(
         makeOpenOptionsPayload(this.#options, resolvedHeaders, published),
       ),
       this.#options,
     );
+    this.#handle = nextHandle;
     this.#headersSignature = nextSignature;
     this.#published = published;
+    currentHandle.close();
   }
 }
 
@@ -485,19 +551,24 @@ async function openHandleBackend(
   optionsJson: string | undefined,
   options: OpenTableOptions,
 ): Promise<HandleBackend> {
+  if (usesCustomFetch(options.fetch)) {
+    return await DirectHandleBackend.open(tableUrl, optionsJson, options.fetch);
+  }
+
   if (!options.noWorker) {
     try {
       return await WorkerHandleBackend.open(
         tableUrl,
         optionsJson,
         options.workerInitTimeoutMs ?? DEFAULT_WORKER_INIT_TIMEOUT_MS,
+        options.workerRequestTimeoutMs,
       );
     } catch {
       // Fall through to the direct runtime if the worker path is unavailable.
     }
   }
 
-  return await DirectHandleBackend.open(tableUrl, optionsJson);
+  return await DirectHandleBackend.open(tableUrl, optionsJson, options.fetch);
 }
 
 function normalizeHttpUrl(value: string, label: string): string {
