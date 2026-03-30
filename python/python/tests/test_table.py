@@ -527,6 +527,36 @@ async def test_add_async(mem_db_async: AsyncConnection):
     assert await table.count_rows() == 3
 
 
+def test_add_overwrite_infers_vector_schema(mem_db: DBConnection):
+    """Overwrite should infer vector columns the same way create_table does.
+
+    Regression test for https://github.com/lancedb/lancedb/issues/3183
+    """
+    table = mem_db.create_table(
+        "test_overwrite_vec",
+        data=[
+            {"vector": [1.0, 2.0, 3.0, 4.0], "item": "foo"},
+            {"vector": [5.0, 6.0, 7.0, 8.0], "item": "bar"},
+        ],
+    )
+    # create_table infers vector as fixed_size_list<float32, 4>
+    original_type = table.schema.field("vector").type
+    assert pa.types.is_fixed_size_list(original_type)
+
+    # overwrite with plain Python lists (PyArrow infers list<double>)
+    table.add(
+        [
+            {"vector": [10.0, 20.0, 30.0, 40.0], "item": "baz"},
+        ],
+        mode="overwrite",
+    )
+    # overwrite should infer vector column the same way as create_table
+    new_type = table.schema.field("vector").type
+    assert pa.types.is_fixed_size_list(new_type), (
+        f"Expected fixed_size_list after overwrite, got {new_type}"
+    )
+
+
 def test_add_progress_callback(mem_db: DBConnection):
     table = mem_db.create_table(
         "test",
@@ -2143,3 +2173,33 @@ def test_table_uri(tmp_path):
     db = lancedb.connect(tmp_path)
     table = db.create_table("my_table", data=[{"x": 0}])
     assert table.uri == str(tmp_path / "my_table.lance")
+
+
+def test_sanitize_data_metadata_not_stripped():
+    """Regression test: dict.update() returns None, so assigning its result
+    would silently replace metadata with None, causing with_metadata(None)
+    to strip all schema metadata from the target schema."""
+    from lancedb.table import _sanitize_data
+
+    schema = pa.schema(
+        [pa.field("x", pa.int64())],
+        metadata={b"existing_key": b"existing_value"},
+    )
+    batch = pa.record_batch([pa.array([1, 2, 3])], schema=schema)
+
+    # Use a different field type so the reader and target schemas differ,
+    # forcing _cast_to_target_schema to rebuild the schema with the
+    # target's metadata (instead of taking the fast-path).
+    target_schema = pa.schema(
+        [pa.field("x", pa.int32())],
+        metadata={b"existing_key": b"existing_value"},
+    )
+
+    reader = pa.RecordBatchReader.from_batches(schema, [batch])
+    metadata = {b"new_key": b"new_value"}
+    result = _sanitize_data(reader, target_schema=target_schema, metadata=metadata)
+
+    result_schema = result.schema
+    assert result_schema.metadata is not None
+    assert result_schema.metadata[b"existing_key"] == b"existing_value"
+    assert result_schema.metadata[b"new_key"] == b"new_value"

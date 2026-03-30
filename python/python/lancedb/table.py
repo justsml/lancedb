@@ -278,7 +278,7 @@ def _sanitize_data(
 
     if metadata:
         new_metadata = target_schema.metadata or {}
-        new_metadata = new_metadata.update(metadata)
+        new_metadata.update(metadata)
         target_schema = target_schema.with_metadata(new_metadata)
 
     _validate_schema(target_schema)
@@ -3857,7 +3857,13 @@ class AsyncTable:
 
         # _santitize_data is an old code path, but we will use it until the
         # new code path is ready.
-        if on_bad_vectors != "error" or (
+        if mode == "overwrite":
+            # For overwrite, apply the same preprocessing as create_table
+            # so vector columns are inferred as FixedSizeList.
+            data, _ = sanitize_create_table(
+                data, None, on_bad_vectors=on_bad_vectors, fill_value=fill_value
+            )
+        elif on_bad_vectors != "error" or (
             schema.metadata is not None and b"embedding_functions" in schema.metadata
         ):
             data = _sanitize_data(
