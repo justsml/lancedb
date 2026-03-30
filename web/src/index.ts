@@ -9,6 +9,13 @@ import type {
   WorkerSuccessResponse,
 } from "./worker_protocol.js";
 
+/**
+ * Options for opening a published Lance table over HTTP.
+ *
+ * This client is intentionally read-only and expects the web publish sidecars
+ * (`_web.json`, `_snapshot.json`, `_latest.manifest`, `_latest.version`) to be
+ * available next to the table.
+ */
 export interface OpenTableOptions {
   fetch?: typeof globalThis.fetch;
   headers?: HeaderProvider;
@@ -30,6 +37,15 @@ export type DistanceType = "l2" | "cosine" | "dot" | "hamming";
 
 export type Selection = string[] | Record<string, string>;
 
+/**
+ * Browser-side search request.
+ *
+ * Notes:
+ * - `text` queries are limited to published FTS columns when metadata is available.
+ * - Browser-side vector execution currently supports `l2`, `cosine`, and `dot`.
+ *   `hamming` is accepted at the type level for parity, but the browser execution
+ *   path does not implement it yet.
+ */
 export interface SearchRequest {
   vector?: Float32Array | number[];
   text?: TextQuery;
@@ -44,6 +60,7 @@ export interface SearchRequest {
   fastSearch?: boolean;
 }
 
+/** Read-only handle for a published HTTP-hosted table. */
 export interface RemoteSearchTable {
   schema(): Promise<Schema>;
   search(request: SearchRequest): Promise<ArrowTable>;
@@ -395,6 +412,13 @@ export function __setWorkerFactoryForTests(
   workerFactoryOverride = factory ?? null;
 }
 
+/**
+ * Open a published Lance table over HTTP.
+ *
+ * The returned table executes search in WASM using published table metadata.
+ * Worker execution is used when possible; supplying a custom `fetch` opts into
+ * the direct runtime path so all HTTP reads go through the provided fetch.
+ */
 export async function openTable(
   tableUrl: string,
   options: OpenTableOptions = {},
