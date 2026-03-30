@@ -36,8 +36,8 @@ use crate::browser_expr::{
 };
 use crate::local_error::{Error, Result};
 use crate::{
-    MANIFEST_PATH, OpenTableOptions, SearchRequest, SelectRequest, TextRequest, build_open_store,
-    object_store_root_url, object_store_table_path, preflight_manifest_check,
+    MANIFEST_PATH, OpenTableOptions, SearchDistanceType, SearchRequest, SelectRequest, TextRequest,
+    build_open_store, object_store_root_url, object_store_table_path, preflight_manifest_check,
 };
 
 const DEFAULT_BATCH_SIZE: u32 = 1024;
@@ -51,6 +51,7 @@ pub struct BrowserTable {
     scan_scheduler: Arc<ScanScheduler>,
     table_path: Path,
     metadata_cache: LanceCache,
+    max_concurrent_ranges: usize,
 }
 
 impl BrowserTable {
@@ -80,7 +81,10 @@ impl BrowserTable {
             wrapper,
             false,
             true,
-            lance_io::object_store::DEFAULT_CLOUD_IO_PARALLELISM,
+            options
+                .max_concurrent_ranges
+                .filter(|value| *value > 0)
+                .unwrap_or(lance_io::object_store::DEFAULT_CLOUD_IO_PARALLELISM),
             lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
             None,
         ));
@@ -107,6 +111,7 @@ impl BrowserTable {
             scan_scheduler,
             table_path,
             metadata_cache,
+            max_concurrent_ranges: options.max_concurrent_ranges.unwrap_or(4).max(1),
         })
     }
 
@@ -173,12 +178,12 @@ impl BrowserTable {
                 limit,
                 offset,
             ),
-            SearchMode::Vector { .. } => finalize_ranked_rows(
+            SearchMode::Vector { distance_type, .. } => finalize_ranked_rows(
                 vector_rows,
                 limit,
                 offset,
                 filter_expr.is_some() && !prefilter,
-                sort_by_distance,
+                sort_vector_rows(distance_type),
             ),
             SearchMode::Text(_) => finalize_ranked_rows(
                 text_rows,
@@ -187,13 +192,13 @@ impl BrowserTable {
                 filter_expr.is_some() && !prefilter,
                 sort_by_text_score,
             ),
-            SearchMode::Hybrid(_) => {
+            SearchMode::Hybrid(plan) => {
                 let ranked_vector = finalize_hybrid_source_rows(
                     vector_rows,
                     limit.unwrap_or(DEFAULT_VECTOR_LIMIT),
                     offset,
                     filter_expr.is_some() && !prefilter,
-                    sort_by_distance,
+                    sort_vector_rows(plan.distance_type),
                 );
                 let ranked_text = finalize_hybrid_source_rows(
                     text_rows,
@@ -285,12 +290,17 @@ impl BrowserTable {
                         relevance_score: None,
                     });
                 }
-                SearchMode::Vector { query_vector, .. } => {
+                SearchMode::Vector {
+                    query_vector,
+                    distance_type,
+                    ..
+                } => {
                     let distance = vector_distance(
                         &batch,
                         vector_index.expect("vector index present"),
                         row_index,
                         query_vector,
+                        *distance_type,
                     )?;
                     vector_rows.push(ResultRow {
                         ordinal: *ordinal,
@@ -324,6 +334,7 @@ impl BrowserTable {
                         vector_index.expect("vector index present"),
                         row_index,
                         &plan.query_vector,
+                        plan.distance_type,
                     )?;
                     vector_rows.push(ResultRow {
                         ordinal: *ordinal,
@@ -408,7 +419,7 @@ impl BrowserTable {
         };
 
         wrap_with_row_id_and_delete(data, fragment.id as u32, config)
-            .buffered(4)
+            .buffered(self.max_concurrent_ranges)
             .try_collect::<Vec<_>>()
             .await
             .map_err(Error::from)
@@ -554,6 +565,7 @@ enum SearchMode {
     Vector {
         vector_column: String,
         query_vector: Vec<f32>,
+        distance_type: SearchDistanceType,
     },
     Text(TextPlan),
     Hybrid(HybridPlan),
@@ -569,6 +581,7 @@ impl SearchMode {
                     }
                 })?,
                 query_vector: vector.clone(),
+                distance_type: request.distance_type.unwrap_or_default(),
                 text: TextPlan::from_request(full_schema, text.clone())?,
             })),
             (Some(vector), None) => Ok(Self::Vector {
@@ -578,6 +591,7 @@ impl SearchMode {
                     }
                 })?,
                 query_vector: vector.clone(),
+                distance_type: request.distance_type.unwrap_or_default(),
             }),
             (None, Some(text)) => Ok(Self::Text(TextPlan::from_request(
                 full_schema,
@@ -665,6 +679,7 @@ impl TextPlan {
 struct HybridPlan {
     vector_column: String,
     query_vector: Vec<f32>,
+    distance_type: SearchDistanceType,
     text: TextPlan,
 }
 
@@ -1042,6 +1057,22 @@ fn sort_by_distance(left: &ResultRow, right: &ResultRow) -> Ordering {
         .then_with(|| left.ordinal.cmp(&right.ordinal))
 }
 
+fn sort_by_distance_desc(left: &ResultRow, right: &ResultRow) -> Ordering {
+    right
+        .distance
+        .expect("distance available")
+        .total_cmp(&left.distance.expect("distance available"))
+        .then_with(|| left.ordinal.cmp(&right.ordinal))
+}
+
+fn sort_vector_rows(distance_type: SearchDistanceType) -> fn(&ResultRow, &ResultRow) -> Ordering {
+    match distance_type {
+        SearchDistanceType::L2 | SearchDistanceType::Cosine => sort_by_distance,
+        SearchDistanceType::Dot => sort_by_distance_desc,
+        SearchDistanceType::Hamming => sort_by_distance,
+    }
+}
+
 fn sort_by_text_score(left: &ResultRow, right: &ResultRow) -> Ordering {
     right
         .text_score
@@ -1202,6 +1233,7 @@ fn vector_distance(
     vector_index: usize,
     row_index: usize,
     query_vector: &[f32],
+    distance_type: SearchDistanceType,
 ) -> Result<f32> {
     let vectors = batch
         .column(vector_index)
@@ -1238,7 +1270,10 @@ fn vector_distance(
     }
 
     let base_offset = row_index * dimension;
-    let mut sum = 0.0_f32;
+    let mut dot = 0.0_f32;
+    let mut value_norm = 0.0_f32;
+    let mut query_norm = 0.0_f32;
+    let mut l2 = 0.0_f32;
     for (index, expected) in query_vector.iter().enumerate() {
         let value_index = base_offset + index;
         if values.is_null(value_index) {
@@ -1247,10 +1282,30 @@ fn vector_distance(
                     .to_string(),
             });
         }
-        let delta = values.value(value_index) - expected;
-        sum += delta * delta;
+        let value = values.value(value_index);
+        let delta = value - expected;
+        dot += value * expected;
+        value_norm += value * value;
+        query_norm += expected * expected;
+        l2 += delta * delta;
     }
-    Ok(sum)
+
+    match distance_type {
+        SearchDistanceType::L2 => Ok(l2),
+        SearchDistanceType::Cosine => {
+            if value_norm == 0.0 || query_norm == 0.0 {
+                return Err(Error::InvalidInput {
+                    message: "cosine distance requires non-zero vectors".to_string(),
+                });
+            }
+            Ok(1.0 - dot / (value_norm.sqrt() * query_norm.sqrt()))
+        }
+        SearchDistanceType::Dot => Ok(dot),
+        SearchDistanceType::Hamming => Err(Error::NotSupported {
+            message: "the browser path currently supports L2, cosine, and dot vector distance only"
+                .to_string(),
+        }),
+    }
 }
 
 fn null_task_stream(
@@ -1424,6 +1479,7 @@ mod tests {
             .search_batches(SearchRequest {
                 vector: None,
                 text: None,
+                distance_type: None,
                 filter: Some("id >= 2".into()),
                 select: Some(SelectRequest::Columns(vec!["id".into()])),
                 limit: Some(1),
@@ -1470,6 +1526,7 @@ mod tests {
                     query: "apple".into(),
                     columns: Some(vec!["doc".into()]),
                 }),
+                distance_type: None,
                 filter: None,
                 select: Some(SelectRequest::Columns(vec!["id".into(), "doc".into()])),
                 limit: Some(2),
@@ -1494,6 +1551,7 @@ mod tests {
                     query: "apple".into(),
                     columns: Some(vec!["doc".into()]),
                 }),
+                distance_type: None,
                 filter: None,
                 select: Some(SelectRequest::Columns(vec!["id".into()])),
                 limit: Some(2),
@@ -1527,6 +1585,7 @@ mod tests {
             .search_batches(SearchRequest {
                 vector: None,
                 text: None,
+                distance_type: None,
                 filter: Some("doc LIKE '%apple%'".into()),
                 select: Some(SelectRequest::Dynamic(std::collections::BTreeMap::from([
                     ("id2".into(), "id * 2".into()),

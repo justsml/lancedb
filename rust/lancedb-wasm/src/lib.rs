@@ -199,6 +199,7 @@ pub struct OpenTableOptions {
 pub struct SearchRequest {
     pub vector: Option<Vec<f32>>,
     pub text: Option<TextRequest>,
+    pub distance_type: Option<SearchDistanceType>,
     pub filter: Option<String>,
     pub select: Option<SelectRequest>,
     pub limit: Option<usize>,
@@ -217,6 +218,16 @@ pub enum TextRequest {
         query: String,
         columns: Option<Vec<String>>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchDistanceType {
+    #[default]
+    L2,
+    Cosine,
+    Dot,
+    Hamming,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -604,12 +615,17 @@ fn apply_published_request_defaults(
                 .map(PublishedMetadataView::Snapshot)
         });
 
-    if request.text.is_some()
-        && published_metadata.is_some_and(|metadata| metadata.fts_columns().is_empty())
-    {
-        return Err(Error::InvalidInput {
-            message: "this table does not advertise any full-text search indexed columns in its published metadata".to_string(),
-        });
+    if let Some(text_request) = request.text.take() {
+        if published_metadata.is_some_and(|metadata| metadata.fts_columns().is_empty()) {
+            return Err(Error::InvalidInput {
+                message: "this table does not advertise any full-text search indexed columns in its published metadata".to_string(),
+            });
+        }
+
+        request.text = Some(apply_published_text_defaults(
+            text_request,
+            published_metadata,
+        )?);
     }
 
     if request.vector.is_some() && request.vector_column.is_none() {
@@ -618,6 +634,58 @@ fn apply_published_request_defaults(
     }
 
     Ok(request)
+}
+
+fn apply_published_text_defaults(
+    request: TextRequest,
+    published_metadata: Option<PublishedMetadataView<'_>>,
+) -> Result<TextRequest> {
+    let Some(published_metadata) = published_metadata else {
+        return Ok(request);
+    };
+
+    let advertised_columns = published_metadata.fts_columns();
+    if advertised_columns.is_empty() {
+        return Ok(request);
+    }
+
+    let (query, columns) = match request {
+        TextRequest::Query(query) => (query, advertised_columns.to_vec()),
+        TextRequest::Structured { query, columns } => (
+            query,
+            columns.unwrap_or_else(|| advertised_columns.to_vec()),
+        ),
+    };
+
+    for column in &columns {
+        if !advertised_columns
+            .iter()
+            .any(|candidate| candidate == column)
+        {
+            return Err(Error::InvalidInput {
+                message: format!(
+                    "text search column '{column}' is not advertised in the published FTS metadata"
+                ),
+            });
+        }
+    }
+
+    Ok(TextRequest::Structured {
+        query,
+        columns: Some(columns),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<SearchDistanceType> for lancedb::DistanceType {
+    fn from(value: SearchDistanceType) -> Self {
+        match value {
+            SearchDistanceType::L2 => Self::L2,
+            SearchDistanceType::Cosine => Self::Cosine,
+            SearchDistanceType::Dot => Self::Dot,
+            SearchDistanceType::Hamming => Self::Hamming,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -902,10 +970,13 @@ async fn execute_table_search(table: &Table, request: SearchRequest) -> Result<V
             if let Some(text) = text {
                 query = query.full_text_search(build_fts_query(text)?);
             }
-            query = apply_common_query(query, &request);
             if let Some(vector_column) = request.vector_column.as_deref() {
                 query = query.column(vector_column);
             }
+            if let Some(distance_type) = request.distance_type {
+                query = query.distance_type(distance_type.into());
+            }
+            query = apply_common_query(query, &request);
             execute_query(query).await
         }
         (None, text) => {

@@ -25,7 +25,8 @@ use tokio::sync::Mutex;
 use tower_http::services::ServeDir;
 
 use lancedb_wasm::{
-    OpenTableOptions, RemoteSearchTable, SearchRequest, SelectRequest, TextRequest,
+    OpenTableOptions, RemoteSearchTable, SearchDistanceType, SearchRequest, SelectRequest,
+    TextRequest,
 };
 
 #[derive(Debug, Clone)]
@@ -207,6 +208,7 @@ async fn opens_reads_schema_and_searches_over_http() {
             .search(SearchRequest {
                 vector: Some(vec![0.0, 0.0]),
                 text: None,
+                distance_type: None,
                 filter: None,
                 select: Some(SelectRequest::Columns(vec!["id".into(), "doc".into()])),
                 limit: Some(2),
@@ -229,6 +231,7 @@ async fn opens_reads_schema_and_searches_over_http() {
             .search(SearchRequest {
                 vector: None,
                 text: Some(TextRequest::Query("apple".into())),
+                distance_type: None,
                 filter: None,
                 select: Some(SelectRequest::Columns(vec!["id".into(), "doc".into()])),
                 limit: Some(2),
@@ -249,6 +252,7 @@ async fn opens_reads_schema_and_searches_over_http() {
             .search(SearchRequest {
                 vector: Some(vec![0.0, 0.0]),
                 text: Some(TextRequest::Query("apple".into())),
+                distance_type: None,
                 filter: None,
                 select: Some(SelectRequest::Columns(vec!["id".into(), "doc".into()])),
                 limit: Some(2),
@@ -312,6 +316,7 @@ async fn refreshes_to_latest_snapshot() {
             .search(SearchRequest {
                 vector: None,
                 text: None,
+                distance_type: None,
                 filter: Some("id = 4".into()),
                 select: Some(SelectRequest::Columns(vec!["id".into()])),
                 limit: Some(1),
@@ -373,4 +378,101 @@ async fn supports_manifest_url_override() {
 
     let schema = lancedb::ipc::ipc_file_to_schema(remote.schema().await.unwrap()).unwrap();
     assert_eq!(schema.field(0).name(), "id");
+}
+
+#[tokio::test]
+async fn honors_explicit_vector_distance_type() {
+    let root = tempfile::tempdir().unwrap();
+    let db = connect(root.path().to_str().unwrap())
+        .execute()
+        .await
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(
+                FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                    [
+                        Some(vec![Some(10.0), Some(0.0)]),
+                        Some(vec![Some(1.0), Some(1.0)]),
+                        Some(vec![Some(0.0), Some(1.0)]),
+                    ],
+                    2,
+                ),
+            ),
+        ],
+    )
+    .unwrap();
+    db.create_table("metric_table", batch)
+        .execute()
+        .await
+        .unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .fallback_service(ServeDir::new(root.path()))
+        .layer(middleware::from_fn_with_state(requests, log_requests));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        serve(listener, app).await.unwrap();
+    });
+
+    let remote = RemoteSearchTable::open(
+        &format!("http://{addr}/metric_table.lance"),
+        OpenTableOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let cosine = decode_batches(
+        remote
+            .search(SearchRequest {
+                vector: Some(vec![1.0, 0.0]),
+                text: None,
+                distance_type: Some(SearchDistanceType::Cosine),
+                filter: None,
+                select: Some(SelectRequest::Columns(vec!["id".into()])),
+                limit: Some(1),
+                offset: None,
+                vector_column: Some("vector".into()),
+                prefilter: None,
+                with_row_id: None,
+                fast_search: None,
+            })
+            .await
+            .unwrap(),
+    );
+    assert_eq!(ids_from_batches(&cosine), vec![1]);
+
+    let l2 = decode_batches(
+        remote
+            .search(SearchRequest {
+                vector: Some(vec![1.0, 0.0]),
+                text: None,
+                distance_type: Some(SearchDistanceType::L2),
+                filter: None,
+                select: Some(SelectRequest::Columns(vec!["id".into()])),
+                limit: Some(1),
+                offset: None,
+                vector_column: Some("vector".into()),
+                prefilter: None,
+                with_row_id: None,
+                fast_search: None,
+            })
+            .await
+            .unwrap(),
+    );
+    assert_eq!(ids_from_batches(&l2), vec![2]);
+
+    server_task.abort();
 }
