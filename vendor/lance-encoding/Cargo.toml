@@ -65,6 +65,14 @@ zstd = { package = "ruzstd", version = "0.8.2", optional = true }
 prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
 
+[dev-dependencies]
+arrow-ord.workspace = true
+lance-datagen.workspace = true
+proptest.workspace = true
+rand_xoshiro.workspace = true
+rstest.workspace = true
+test-log.workspace = true
+
 [features]
 default = ["lz4", "zstd", "bitpacking"]
 protoc = ["dep:protobuf-src"]
