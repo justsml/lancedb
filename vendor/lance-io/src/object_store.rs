@@ -346,19 +346,35 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
 fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     let str_path = str_path.as_ref();
     let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
+    let expanded_path = std::path::PathBuf::from(expanded);
+    let absolute_path = if expanded_path.is_absolute() {
+        expanded_path
+    } else {
+        std::env::current_dir()?.join(expanded_path)
+    };
 
-    let mut expanded_path = path_abs::PathAbs::new(expanded)
-        .unwrap()
-        .as_path()
-        .to_path_buf();
-    // path_abs::PathAbs::new(".") returns an empty string.
-    if let Some(s) = expanded_path.as_path().to_str()
-        && s.is_empty()
-    {
-        expanded_path = std::env::current_dir()?;
+    Ok(normalize_local_path(&absolute_path))
+}
+
+fn normalize_local_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            root @ Component::RootDir => normalized.push(root.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
     }
 
-    Ok(expanded_path)
+    normalized
 }
 
 fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
@@ -381,7 +397,7 @@ fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
 fn local_path_to_url(str_path: &str) -> Result<Url> {
     let expanded_path = expand_path(str_path)?;
 
-    Url::from_directory_path(expanded_path).map_err(|_| {
+    Url::from_file_path(expanded_path).map_err(|_| {
         Error::invalid_input_source(format!("Invalid table location: '{}'", str_path).into())
     })
 }
