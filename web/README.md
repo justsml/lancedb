@@ -19,6 +19,97 @@ const results = await table.search({
 table.close();
 ```
 
+## Text search w/ query embedding generation
+
+Use the optional `@lancedb/lancedb-web/transformers` wrapper when you want
+`table.search({ text })` to mean "embed this query locally and run a vector
+search". This is separate from the base `openTable()` API, where
+`search({ text })` continues to mean full-text search against published FTS
+columns.
+
+Install the wrapper dependency alongside the web client:
+
+```bash
+pnpm add @lancedb/lancedb-web @huggingface/transformers
+```
+
+```ts
+import { searchTable } from "@lancedb/lancedb-web/transformers";
+
+const table = await searchTable(
+  "https://example.com/my_table.lance",
+  "BAAI/bge-small-en-v1.5",
+);
+
+const results = await table.search({
+  text: "best places to hike in colorado",
+  limit: 5,
+});
+```
+
+- `searchTable(url, model)` opens the published table and configures the default
+  query embedding model.
+- `searchTable(url, { model, ...openTableOptions })` also accepts the same HTTP
+  options as `openTable()`, plus wrapper-specific settings like `pooling`,
+  `normalize`, `prepareQuery`, `tokenizer`, `modelOptions`, and
+  `tokenizerOptions`.
+- `table.search({ text, locale, debug, ...vectorSearchOptions })` embeds the
+  query on the client and forwards the resulting `vector` to
+  `@lancedb/lancedb-web`.
+- `debug: true` logs the resolved model, pooling strategy, prepared query, and
+  embedding dimensions to `console.debug`.
+- `locale` is forwarded to `prepareQuery` when you need locale-specific query
+  prefixes or task instructions.
+- Defaults are chosen for common browser-capable models:
+  `Xenova/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`,
+  `sentence-transformers/all-mpnet-base-v2`, and
+  `BAAI/bge-multilingual-gemma2`.
+- Very large models are usually better suited to a Worker, Node runtime, or
+  edge/server deployment, even though the wrapper only needs the final query
+  vector.
+
+## Bring your own query embeddings
+
+If you prefer not to use `@lancedb/lancedb-web/transformers`, compute the query
+vector yourself and pass it to `search({ vector })`. The query-time model should
+match the embedding space used to build the table, or a compatible ONNX export
+of that same model.
+
+### Browser example with `transformers.js`
+
+```ts
+import { pipeline } from "@huggingface/transformers";
+import { openTable } from "@lancedb/lancedb-web";
+
+const table = await openTable("https://example.com/my_table.lance");
+
+// Create this once and reuse it across queries.
+const extractor = await pipeline(
+  "feature-extraction",
+  "Xenova/all-MiniLM-L6-v2",
+);
+
+const output = await extractor("best places to hike in colorado", {
+  pooling: "mean",
+  normalize: true,
+});
+
+const vector = output.tolist()[0] as number[];
+
+const results = await table.search({
+  vector,
+  limit: 5,
+});
+
+table.close();
+```
+
+### Other ONNX packages
+
+If you already compute query embeddings with another ONNX package such as
+`fastembed`, pass the resulting `number[]` directly into
+`table.search({ vector })`.
+
 ## Runtime notes
 
 - The package is read-only. It supports `schema`, `search`, `refresh`, and `close` only.
@@ -42,5 +133,6 @@ table.close();
 
 ## Development
 
-- `npm test -- --runInBand`
-- `npm run build`
+- This package is pinned to `pnpm@10.33.0` and enforces a 3-day minimum package age for installs.
+- `pnpm test`
+- `pnpm build`

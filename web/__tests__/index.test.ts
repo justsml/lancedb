@@ -382,6 +382,24 @@ describe("@lancedb/lancedb-web", () => {
       }),
     ).rejects.toThrow(/Expected status 206/);
   });
+
+  it("fails fast when the manifest preflight response omits Content-Range", async () => {
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: async () => makeHandle(),
+    }));
+
+    await expect(
+      openTable("https://example.com/search_table.lance", {
+        fetch: (async (input: RequestInfo | URL) => {
+          const url = input.toString();
+          if (url.endsWith("/_web.json") || url.endsWith("/_snapshot.json")) {
+            return new Response(null, { status: 404 });
+          }
+          return new Response(new Uint8Array([1]), { status: 206 });
+        }) as unknown as typeof globalThis.fetch,
+      }),
+    ).rejects.toThrow(/Content-Range header/);
+  });
 });
 
 function successfulFetch(): typeof globalThis.fetch {
