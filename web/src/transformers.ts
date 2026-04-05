@@ -27,9 +27,9 @@ export interface QueryTransformContext {
  */
 export interface EmbeddingModel {
   /** Embed a single text value. */
-  embed(value: string): Promise<EmbedResult>;
+  embed(value: string, options?: { signal?: AbortSignal }): Promise<EmbedResult>;
   /** Embed multiple text values. */
-  embedMany(values: string[]): Promise<EmbedManyResult>;
+  embedMany(values: string[], options?: { signal?: AbortSignal }): Promise<EmbedManyResult>;
   /**
    * Eagerly load the model weights and tokenizer so the first `embed()` call
    * doesn't pay the full download + init cost.  No-op if already loaded or if
@@ -153,6 +153,8 @@ export interface EmbedRequest {
    * auto-promoted to one via `transformersEmbedder()`.
    */
   model?: string | EmbeddingModel;
+  /** Abort signal for cancellation (e.g. typeahead debouncing). */
+  signal?: AbortSignal;
 }
 
 export interface EmbedManyRequest {
@@ -163,6 +165,8 @@ export interface EmbedManyRequest {
    * auto-promoted to one via `transformersEmbedder()`.
    */
   model?: string | EmbeddingModel;
+  /** Abort signal for cancellation. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -179,7 +183,7 @@ export interface EmbedManyRequest {
  */
 export async function embed(request: EmbedRequest): Promise<EmbedResult> {
   const model = resolveModel(request.model);
-  return model.embed(request.value);
+  return model.embed(request.value, { signal: request.signal });
 }
 
 /**
@@ -198,7 +202,7 @@ export async function embedMany(
   request: EmbedManyRequest,
 ): Promise<EmbedManyResult> {
   const model = resolveModel(request.model);
-  return model.embedMany(request.values);
+  return model.embedMany(request.values, { signal: request.signal });
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +262,8 @@ export interface TextEmbeddingSearchRequest
    * When true, logs the resolved embedding configuration to `console.debug`.
    */
   debug?: boolean;
+  /** Abort signal for cancellation (e.g. typeahead debouncing). */
+  signal?: AbortSignal;
 }
 
 export interface TextEmbeddingSearchTable {
@@ -502,16 +508,23 @@ function buildEmbeddingModel(
     ...options.tokenizerOptions,
   };
 
-  async function embedOne(value: string): Promise<number[]> {
+  async function embedOne(
+    value: string,
+    signal?: AbortSignal,
+  ): Promise<number[]> {
+    signal?.throwIfAborted();
     const prepared = prepareQuery(value, { model: modelId });
     const { tokenizer, model } = await loadSharedResources(
       modelId,
       tokenizerId,
       modelOptions,
     );
+    signal?.throwIfAborted();
     const inputs = await tokenizer([prepared], tokenizerOptions);
+    signal?.throwIfAborted();
     const attentionMask = extractAttentionMask(inputs);
     const outputs = await model.forward(inputs);
+    signal?.throwIfAborted();
     let vector = poolTensor(firstTensor(outputs), pooling, attentionMask);
     if (normalize) {
       vector = normalizeVector(vector);
@@ -522,11 +535,21 @@ function buildEmbeddingModel(
   const cacheKey = resourcesCacheKey(modelId, tokenizerId, modelOptions);
 
   return {
-    async embed(value: string): Promise<EmbedResult> {
-      return { embedding: await embedOne(value) };
+    async embed(
+      value: string,
+      opts?: { signal?: AbortSignal },
+    ): Promise<EmbedResult> {
+      return { embedding: await embedOne(value, opts?.signal) };
     },
-    async embedMany(values: string[]): Promise<EmbedManyResult> {
-      const embeddings = await Promise.all(values.map(embedOne));
+    async embedMany(
+      values: string[],
+      opts?: { signal?: AbortSignal },
+    ): Promise<EmbedManyResult> {
+      const signal = opts?.signal;
+      const embeddings: number[][] = [];
+      for (const value of values) {
+        embeddings.push(await embedOne(value, signal));
+      }
       return { embeddings };
     },
     async preload(): Promise<void> {
@@ -556,8 +579,8 @@ class TextEmbeddingSearchTableImpl implements TextEmbeddingSearchTable {
   }
 
   async search(request: TextEmbeddingSearchRequest): Promise<ArrowTable> {
-    const { text, debug, ...vectorSearchRequest } = request;
-    const { embedding } = await this.model.embed(text);
+    const { text, debug, signal, ...vectorSearchRequest } = request;
+    const { embedding } = await this.model.embed(text, { signal });
 
     if (debug && typeof console.debug === "function") {
       console.debug("[@lancedb/lancedb-web/transformers]", {
