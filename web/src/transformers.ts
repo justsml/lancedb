@@ -378,7 +378,7 @@ type TransformersModule = {
 type TokenizerLike = (
   input: string | string[],
   options?: TokenizerOptions,
-) => Promise<Record<string, unknown>>;
+) => Record<string, unknown> | Promise<Record<string, unknown>>;
 
 type ModelLike = {
   forward(
@@ -640,11 +640,18 @@ class TextEmbeddingSearchTableImpl implements TextEmbeddingSearchTable {
 // Transformers.js loader
 // ---------------------------------------------------------------------------
 
+// Use Function constructor instead of eval to load the optional peer
+// dependency at runtime.  This avoids CSP `unsafe-eval` restrictions in
+// strict environments while still preventing bundlers from statically
+// resolving the import.
+const dynamicImport = new Function(
+  "specifier",
+  "return import(specifier)",
+) as (specifier: string) => Promise<TransformersModule>;
+
 async function defaultTransformersModuleLoader(): Promise<TransformersModule> {
   try {
-    return (await eval(
-      'import("@huggingface/transformers")',
-    )) as TransformersModule;
+    return await dynamicImport("@huggingface/transformers");
   } catch (error) {
     throw new Error(
       "Failed to load @huggingface/transformers. Install it to use `@lancedb/lancedb-web/transformers`.",
