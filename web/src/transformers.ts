@@ -645,8 +645,16 @@ function poolTensor(
   }
 
   if (tensor.dims.length === 2) {
-    const hiddenSize = tensor.dims[1];
-    return Array.from(tensor.data).slice(0, hiddenSize);
+    const [tokenCount, hiddenSize] = tensor.dims;
+    const data = tensor.data;
+    switch (pooling) {
+      case "cls":
+        return sliceToken(data, 0, hiddenSize);
+      case "last_token":
+        return sliceToken(data, tokenCount - 1, hiddenSize);
+      case "mean":
+        return meanPool(data, tokenCount, hiddenSize);
+    }
   }
 
   if (tensor.dims.length !== 3) {
