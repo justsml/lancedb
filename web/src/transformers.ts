@@ -618,7 +618,18 @@ function isChineseBgeModel(model: string): boolean {
 // Tensor utilities
 // ---------------------------------------------------------------------------
 
+/** Known output keys in priority order. */
+const PREFERRED_OUTPUT_KEYS = ["last_hidden_state", "hidden_states", "embeddings"];
+
 function firstTensor(outputs: Record<string, unknown>): TensorLike {
+  // Try well-known keys first so we don't accidentally grab pooler_output or attentions.
+  for (const key of PREFERRED_OUTPUT_KEYS) {
+    const value = outputs[key];
+    if (value !== undefined && isTensorLike(value)) {
+      return value;
+    }
+  }
+  // Fallback: first tensor-like value.
   for (const value of Object.values(outputs)) {
     if (isTensorLike(value)) {
       return value;
