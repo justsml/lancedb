@@ -54,6 +54,10 @@ export interface SearchRequest {
   select?: Selection;
   limit?: number;
   offset?: number;
+  /**
+   * The vector column to search against.  When omitted, defaults to the
+   * `defaultVectorColumn` from the table's published metadata (`_web.json`).
+   */
   vectorColumn?: string;
   prefilter?: boolean;
   withRowId?: boolean;
