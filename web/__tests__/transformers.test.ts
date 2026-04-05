@@ -493,4 +493,238 @@ describe("@lancedb/lancedb-web/transformers", () => {
     expect(transformers.AutoModel.from_pretrained).toHaveBeenCalledTimes(1);
     expect(transformers.AutoTokenizer.from_pretrained).toHaveBeenCalledTimes(1);
   });
+
+  // -----------------------------------------------------------------------
+  // #10 — last_token pooling
+  // -----------------------------------------------------------------------
+
+  it("uses last_token pooling for BAAI/bge-multilingual-gemma2", async () => {
+    const capture = { inputs: [] as string[][] };
+    // 3 tokens, hidden size 2: last token is [5, 6]
+    const transformers = makeTransformersModule(
+      { dims: [1, 3, 2], data: [1, 2, 3, 4, 5, 6] },
+      capture,
+    );
+    __setTransformersModuleLoaderForTests(async () => transformers);
+
+    const model = transformersEmbedder("BAAI/bge-multilingual-gemma2", {
+      normalize: false,
+    });
+    const { embedding } = await model.embed("test query");
+
+    // last_token pooling → last token [5, 6]
+    expect(embedding).toEqual([5, 6]);
+  });
+
+  // -----------------------------------------------------------------------
+  // #11 — normalization (the default normalize: true path)
+  // -----------------------------------------------------------------------
+
+  it("normalizes embeddings by default", async () => {
+    const capture = { inputs: [] as string[][] };
+    // Single token [3, 4] → magnitude 5 → normalized [0.6, 0.8]
+    const transformers = makeTransformersModule(
+      { dims: [1, 1, 2], data: [3, 4] },
+      capture,
+    );
+    __setTransformersModuleLoaderForTests(async () => transformers);
+
+    // Default normalize: true
+    const model = transformersEmbedder();
+    const { embedding } = await model.embed("test");
+
+    expect(embedding[0]).toBeCloseTo(0.6);
+    expect(embedding[1]).toBeCloseTo(0.8);
+    // Verify it's a unit vector
+    const magnitude = Math.sqrt(
+      embedding.reduce((sum, v) => sum + v * v, 0),
+    );
+    expect(magnitude).toBeCloseTo(1.0);
+  });
+
+  // -----------------------------------------------------------------------
+  // #12 — error paths
+  // -----------------------------------------------------------------------
+
+  it("throws when model load fails", async () => {
+    __setTransformersModuleLoaderForTests(async () => ({
+      AutoModel: {
+        from_pretrained: async () => {
+          throw new Error("network error");
+        },
+      },
+      AutoTokenizer: {
+        from_pretrained: async () => jest.fn(),
+      },
+    }));
+
+    const model = transformersEmbedder();
+    await expect(model.embed("test")).rejects.toThrow(
+      /Failed to initialize transformers model/,
+    );
+  });
+
+  it("throws when model output contains no tensor", async () => {
+    __setTransformersModuleLoaderForTests(async () => ({
+      AutoModel: {
+        from_pretrained: async () => ({
+          forward: async () => ({ some_string: "not a tensor" }),
+        }),
+      },
+      AutoTokenizer: {
+        from_pretrained: async () => jest.fn(async () => ({})),
+      },
+    }));
+
+    const model = transformersEmbedder();
+    await expect(model.embed("test")).rejects.toThrow(
+      /did not contain an embedding tensor/,
+    );
+  });
+
+  it("throws for unsupported tensor shape", async () => {
+    __setTransformersModuleLoaderForTests(async () => ({
+      AutoModel: {
+        from_pretrained: async () => ({
+          forward: async () => ({
+            last_hidden_state: {
+              dims: [1, 2, 3, 4],
+              data: Float32Array.from([0]),
+            },
+          }),
+        }),
+      },
+      AutoTokenizer: {
+        from_pretrained: async () => jest.fn(async () => ({})),
+      },
+    }));
+
+    const model = transformersEmbedder();
+    await expect(model.embed("test")).rejects.toThrow(
+      /Unsupported embedding tensor shape/,
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // #13 — Chinese BGE prefix and Gemma2 instruction format
+  // -----------------------------------------------------------------------
+
+  it("applies Chinese BGE retrieval prefix", async () => {
+    const capture = { inputs: [] as string[][] };
+    const transformers = makeTransformersModule(
+      { dims: [1, 1, 2], data: [1, 0] },
+      capture,
+    );
+    __setTransformersModuleLoaderForTests(async () => transformers);
+
+    const model = transformersEmbedder("BAAI/bge-large-zh-v1.5", {
+      normalize: false,
+    });
+    await model.embed("测试查询");
+
+    expect(capture.inputs).toEqual([
+      ["为这个句子生成表示以用于检索相关文章：测试查询"],
+    ]);
+  });
+
+  it("applies Gemma2 multilingual instruction format", async () => {
+    const capture = { inputs: [] as string[][] };
+    const transformers = makeTransformersModule(
+      { dims: [1, 3, 2], data: [1, 2, 3, 4, 5, 6] },
+      capture,
+    );
+    __setTransformersModuleLoaderForTests(async () => transformers);
+
+    const model = transformersEmbedder("BAAI/bge-multilingual-gemma2", {
+      normalize: false,
+    });
+    await model.embed("search query");
+
+    expect(capture.inputs[0][0]).toMatch(
+      /^<instruct>Given a web search query.*\n<query>search query$/,
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // #14 — concurrent embed() calls share the same model load
+  // -----------------------------------------------------------------------
+
+  it("concurrent embed calls share a single model load", async () => {
+    const capture = { inputs: [] as string[][] };
+    const transformers = makeTransformersModule(
+      { dims: [1, 1, 2], data: [1, 0] },
+      capture,
+    );
+    __setTransformersModuleLoaderForTests(async () => transformers);
+
+    const model = transformersEmbedder({ normalize: false });
+
+    // Fire three embed calls concurrently
+    const [r1, r2, r3] = await Promise.all([
+      model.embed("a"),
+      model.embed("b"),
+      model.embed("c"),
+    ]);
+
+    // All should resolve successfully
+    expect(r1.embedding).toEqual([1, 0]);
+    expect(r2.embedding).toEqual([1, 0]);
+    expect(r3.embedding).toEqual([1, 0]);
+
+    // Model should only have been loaded once despite concurrent calls
+    expect(transformers.AutoModel.from_pretrained).toHaveBeenCalledTimes(1);
+    expect(transformers.AutoTokenizer.from_pretrained).toHaveBeenCalledTimes(1);
+  });
+
+  // -----------------------------------------------------------------------
+  // preload / dispose
+  // -----------------------------------------------------------------------
+
+  it("preload() eagerly loads and dispose() releases cached resources", async () => {
+    const capture = { inputs: [] as string[][] };
+    const transformers = makeTransformersModule(
+      { dims: [1, 1, 2], data: [1, 0] },
+      capture,
+    );
+    __setTransformersModuleLoaderForTests(async () => transformers);
+
+    const model = transformersEmbedder({ normalize: false });
+
+    // preload triggers model load before first embed
+    await model.preload!();
+    expect(transformers.AutoModel.from_pretrained).toHaveBeenCalledTimes(1);
+
+    // embed reuses the preloaded model
+    await model.embed("test");
+    expect(transformers.AutoModel.from_pretrained).toHaveBeenCalledTimes(1);
+
+    // dispose releases — next embed reloads
+    model.dispose!();
+    await model.embed("test2");
+    expect(transformers.AutoModel.from_pretrained).toHaveBeenCalledTimes(2);
+  });
+
+  // -----------------------------------------------------------------------
+  // AbortSignal
+  // -----------------------------------------------------------------------
+
+  it("embed() rejects immediately when signal is already aborted", async () => {
+    const capture = { inputs: [] as string[][] };
+    const transformers = makeTransformersModule(
+      { dims: [1, 1, 2], data: [1, 0] },
+      capture,
+    );
+    __setTransformersModuleLoaderForTests(async () => transformers);
+
+    const model = transformersEmbedder();
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      model.embed("test", { signal: controller.signal }),
+    ).rejects.toBeDefined();
+
+    // Model forward should never have been called
+    expect(transformers.AutoModel.from_pretrained).not.toHaveBeenCalled();
+  });
 });
