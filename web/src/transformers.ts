@@ -30,6 +30,18 @@ export interface EmbeddingModel {
   embed(value: string): Promise<EmbedResult>;
   /** Embed multiple text values. */
   embedMany(values: string[]): Promise<EmbedManyResult>;
+  /**
+   * Eagerly load the model weights and tokenizer so the first `embed()` call
+   * doesn't pay the full download + init cost.  No-op if already loaded or if
+   * the implementation doesn't support preloading.
+   */
+  preload?(): Promise<void>;
+  /**
+   * Release the loaded model and tokenizer from memory.  After calling
+   * `dispose()` the model can still be used — it will simply re-download on
+   * the next `embed()` call.
+   */
+  dispose?(): void;
 }
 
 /**
@@ -507,6 +519,8 @@ function buildEmbeddingModel(
     return vector;
   }
 
+  const cacheKey = resourcesCacheKey(modelId, tokenizerId, modelOptions);
+
   return {
     async embed(value: string): Promise<EmbedResult> {
       return { embedding: await embedOne(value) };
@@ -514,6 +528,12 @@ function buildEmbeddingModel(
     async embedMany(values: string[]): Promise<EmbedManyResult> {
       const embeddings = await Promise.all(values.map(embedOne));
       return { embeddings };
+    },
+    async preload(): Promise<void> {
+      await loadSharedResources(modelId, tokenizerId, modelOptions);
+    },
+    dispose(): void {
+      resourcesCache.delete(cacheKey);
     },
   };
 }
