@@ -9,8 +9,8 @@ import {
 export type PoolingStrategy = "mean" | "cls" | "last_token";
 
 export interface QueryTransformContext {
+  /** The Hugging Face model id being used to embed. */
   model: string;
-  locale?: string;
 }
 
 // ---------------------------------------------------------------------------
