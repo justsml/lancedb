@@ -96,18 +96,7 @@ interface PublishedTableMetadata {
   ftsColumns: string[];
 }
 
-interface PublishedSnapshot {
-  version: number;
-  manifestPath: string;
-  manifestSizeBytes?: number;
-  manifestNamingScheme: string;
-  latestManifestPath: string;
-  latestVersionPath: string;
-  webMetadataPath: string;
-  snapshotPath: string;
-  defaultVectorColumn?: string;
-  vectorColumns: string[];
-  ftsColumns: string[];
+interface PublishedSnapshot extends PublishedTableMetadata {
   isComplete: boolean;
 }
 
@@ -535,6 +524,11 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
   async #ensureHandle(): Promise<void> {
     if (this.#handle === null) {
       throw new Error("RemoteSearchTable is closed");
+    }
+
+    // Static headers can never change — skip the resolve + serialize overhead.
+    if (typeof this.#options.headers !== "function") {
+      return;
     }
 
     const headers = await resolveHeaders(this.#options.headers);

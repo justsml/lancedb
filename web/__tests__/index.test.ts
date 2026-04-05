@@ -557,8 +557,6 @@ function makeWorker(
 }
 
 function copyBuffer(bytes: Uint8Array): ArrayBuffer {
-  const owned = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
-    ? new Uint8Array(bytes)
-    : bytes.slice();
-  return owned.buffer.slice(0) as ArrayBuffer;
+  const ownsBuffer = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
+  return (ownsBuffer ? bytes.buffer : bytes.slice().buffer) as ArrayBuffer;
 }

@@ -68,10 +68,8 @@ function postBytesResponse(
   type: "schema" | "search",
   bytes: Uint8Array,
 ): void {
-  const owned = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
-    ? new Uint8Array(bytes)
-    : bytes.slice();
-  const transfer = owned.buffer.slice(0) as ArrayBuffer;
+  const ownsBuffer = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
+  const transfer = (ownsBuffer ? bytes.buffer : bytes.slice().buffer) as ArrayBuffer;
   const message: WorkerResponse = {
     id,
     ok: true,

@@ -53,13 +53,11 @@ const results = await table.search({
   options as `openTable()`, plus wrapper-specific settings like `pooling`,
   `normalize`, `prepareQuery`, `tokenizer`, `modelOptions`, and
   `tokenizerOptions`.
-- `table.search({ text, locale, debug, ...vectorSearchOptions })` embeds the
+- `table.search({ text, debug, ...vectorSearchOptions })` embeds the
   query on the client and forwards the resulting `vector` to
   `@lancedb/lancedb-web`.
-- `debug: true` logs the resolved model, pooling strategy, prepared query, and
-  embedding dimensions to `console.debug`.
-- `locale` is forwarded to `prepareQuery` when you need locale-specific query
-  prefixes or task instructions.
+- `debug: true` logs the resolved model and embedding dimensions to
+  `console.debug`.
 - Defaults are chosen for common browser-capable models:
   `Xenova/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`,
   `sentence-transformers/all-mpnet-base-v2`, and

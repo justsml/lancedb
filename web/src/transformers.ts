@@ -640,10 +640,13 @@ class TextEmbeddingSearchTableImpl implements TextEmbeddingSearchTable {
 // Transformers.js loader
 // ---------------------------------------------------------------------------
 
-// Use Function constructor instead of eval to load the optional peer
-// dependency at runtime.  This avoids CSP `unsafe-eval` restrictions in
-// strict environments while still preventing bundlers from statically
-// resolving the import.
+// Use Function constructor to load the optional peer dependency at runtime.
+// This prevents bundlers from statically resolving the import so
+// @huggingface/transformers stays a true optional peer dependency.
+//
+// NOTE: `new Function` still requires `unsafe-eval` in strict CSP policies,
+// just like `eval`.  If your environment forbids `unsafe-eval`, override the
+// loader via `__setTransformersModuleLoaderForTests` or pre-import the module.
 const dynamicImport = new Function(
   "specifier",
   "return import(specifier)",
