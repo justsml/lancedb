@@ -498,8 +498,9 @@ function buildEmbeddingModel(
       modelOptions,
     );
     const inputs = await tokenizer([prepared], tokenizerOptions);
+    const attentionMask = extractAttentionMask(inputs);
     const outputs = await model.forward(inputs);
-    let vector = poolTensor(firstTensor(outputs), pooling);
+    let vector = poolTensor(firstTensor(outputs), pooling, attentionMask);
     if (normalize) {
       vector = normalizeVector(vector);
     }
@@ -647,9 +648,20 @@ function isTensorLike(value: unknown): value is TensorLike {
   return Array.isArray(candidate.dims) && candidate.data !== undefined;
 }
 
+function extractAttentionMask(
+  inputs: Record<string, unknown>,
+): TensorLike | undefined {
+  const mask = inputs.attention_mask;
+  if (mask !== undefined && isTensorLike(mask)) {
+    return mask;
+  }
+  return undefined;
+}
+
 function poolTensor(
   tensor: TensorLike,
   pooling: PoolingStrategy,
+  attentionMask?: TensorLike,
 ): number[] {
   if (tensor.dims.length === 1) {
     return Array.from(tensor.data);
@@ -658,13 +670,15 @@ function poolTensor(
   if (tensor.dims.length === 2) {
     const [tokenCount, hiddenSize] = tensor.dims;
     const data = tensor.data;
+    // For 2D tensors the mask (if present) has shape [1, tokenCount] or [tokenCount].
+    const mask1d = flattenMaskForBatchElement(attentionMask, 0, tokenCount);
     switch (pooling) {
       case "cls":
         return sliceToken(data, 0, hiddenSize);
       case "last_token":
         return sliceToken(data, tokenCount - 1, hiddenSize);
       case "mean":
-        return meanPool(data, tokenCount, hiddenSize);
+        return meanPool(data, tokenCount, hiddenSize, mask1d);
     }
   }
 
@@ -680,13 +694,14 @@ function poolTensor(
   }
 
   const data = tensor.data;
+  const mask1d = flattenMaskForBatchElement(attentionMask, 0, tokenCount);
   switch (pooling) {
     case "cls":
       return sliceToken(data, 0, hiddenSize);
     case "last_token":
       return sliceToken(data, tokenCount - 1, hiddenSize);
     case "mean":
-      return meanPool(data, tokenCount, hiddenSize);
+      return meanPool(data, tokenCount, hiddenSize, mask1d);
   }
 }
 
@@ -703,20 +718,56 @@ function sliceToken(
   return result;
 }
 
+/**
+ * Extract a 1D mask slice for a given batch element from the attention mask
+ * tensor.  Returns `undefined` when no mask is available (all tokens are
+ * treated as real).
+ */
+function flattenMaskForBatchElement(
+  mask: TensorLike | undefined,
+  batchIndex: number,
+  tokenCount: number,
+): ArrayLike<number> | undefined {
+  if (mask === undefined) {
+    return undefined;
+  }
+  // 1D mask — applies directly.
+  if (mask.dims.length === 1) {
+    return mask.data;
+  }
+  // 2D mask [batchSize, seqLen] — slice the row for this batch element.
+  if (mask.dims.length === 2) {
+    const seqLen = mask.dims[1];
+    const start = batchIndex * seqLen;
+    const out = new Array<number>(tokenCount);
+    for (let i = 0; i < tokenCount; i += 1) {
+      out[i] = mask.data[start + i];
+    }
+    return out;
+  }
+  return undefined;
+}
+
 function meanPool(
   data: ArrayLike<number>,
   tokenCount: number,
   hiddenSize: number,
+  mask?: ArrayLike<number>,
 ): number[] {
   const result = new Array<number>(hiddenSize).fill(0);
+  let maskSum = 0;
   for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+    const weight = mask ? mask[tokenIndex] : 1;
+    if (weight === 0) continue;
+    maskSum += weight;
     const offset = tokenIndex * hiddenSize;
     for (let i = 0; i < hiddenSize; i += 1) {
-      result[i] += data[offset + i];
+      result[i] += data[offset + i] * weight;
     }
   }
+  const divisor = maskSum > 0 ? maskSum : 1;
   for (let i = 0; i < hiddenSize; i += 1) {
-    result[i] /= tokenCount;
+    result[i] /= divisor;
   }
   return result;
 }
