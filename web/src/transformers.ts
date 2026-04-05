@@ -640,21 +640,13 @@ class TextEmbeddingSearchTableImpl implements TextEmbeddingSearchTable {
 // Transformers.js loader
 // ---------------------------------------------------------------------------
 
-// Use Function constructor to load the optional peer dependency at runtime.
-// This prevents bundlers from statically resolving the import so
-// @huggingface/transformers stays a true optional peer dependency.
-//
-// NOTE: `new Function` still requires `unsafe-eval` in strict CSP policies,
-// just like `eval`.  If your environment forbids `unsafe-eval`, override the
-// loader via `__setTransformersModuleLoaderForTests` or pre-import the module.
-const dynamicImport = new Function(
-  "specifier",
-  "return import(specifier)",
-) as (specifier: string) => Promise<TransformersModule>;
-
 async function defaultTransformersModuleLoader(): Promise<TransformersModule> {
+  // The variable indirection plus bundler-specific comments prevent bundlers
+  // from statically resolving the import, keeping @huggingface/transformers
+  // a true optional peer dependency — without requiring `unsafe-eval` CSP.
+  const specifier = "@huggingface/transformers";
   try {
-    return await dynamicImport("@huggingface/transformers");
+    return await import(/* webpackIgnore: true */ /* @vite-ignore */ specifier);
   } catch (error) {
     throw new Error(
       "Failed to load @huggingface/transformers. Install it to use `@lancedb/lancedb-web/transformers`.",
