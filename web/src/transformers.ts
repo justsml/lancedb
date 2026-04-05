@@ -545,10 +545,42 @@ function buildEmbeddingModel(
       values: string[],
       opts?: { signal?: AbortSignal },
     ): Promise<EmbedManyResult> {
+      if (values.length === 0) {
+        return { embeddings: [] };
+      }
+      if (values.length === 1) {
+        return { embeddings: [await embedOne(values[0], opts?.signal)] };
+      }
+
       const signal = opts?.signal;
-      const embeddings: number[][] = [];
-      for (const value of values) {
-        embeddings.push(await embedOne(value, signal));
+      signal?.throwIfAborted();
+
+      const prepared = values.map((v) =>
+        prepareQuery(v, { model: modelId }),
+      );
+      const { tokenizer, model } = await loadSharedResources(
+        modelId,
+        tokenizerId,
+        modelOptions,
+      );
+      signal?.throwIfAborted();
+
+      const inputs = await tokenizer(prepared, tokenizerOptions);
+      signal?.throwIfAborted();
+
+      const attentionMask = extractAttentionMask(inputs);
+      const outputs = await model.forward(inputs);
+      signal?.throwIfAborted();
+
+      const tensor = firstTensor(outputs);
+      const embeddings = poolBatchTensor(
+        tensor,
+        pooling,
+        values.length,
+        attentionMask,
+      );
+      if (normalize) {
+        return { embeddings: embeddings.map(normalizeVector) };
       }
       return { embeddings };
     },
@@ -748,12 +780,63 @@ function poolTensor(
   }
 }
 
+/**
+ * Pool a multi-batch 3D tensor `[batchSize, tokenCount, hiddenSize]` into one
+ * embedding per batch element.
+ */
+function poolBatchTensor(
+  tensor: TensorLike,
+  pooling: PoolingStrategy,
+  batchSize: number,
+  attentionMask?: TensorLike,
+): number[][] {
+  // For 1D or 2D outputs, batch isn't encoded in the shape — fall back to
+  // single-element pooling (caller should have used poolTensor instead).
+  if (tensor.dims.length < 3) {
+    return [poolTensor(tensor, pooling, attentionMask)];
+  }
+
+  const tokenCount = tensor.dims[1];
+  const hiddenSize = tensor.dims[2];
+  const batchStride = tokenCount * hiddenSize;
+  const data = tensor.data;
+  const results: number[][] = [];
+
+  for (let b = 0; b < batchSize; b += 1) {
+    const offset = b * batchStride;
+    const mask1d = flattenMaskForBatchElement(attentionMask, b, tokenCount);
+
+    switch (pooling) {
+      case "cls":
+        results.push(sliceTokenAt(data, offset, 0, hiddenSize));
+        break;
+      case "last_token":
+        results.push(sliceTokenAt(data, offset, tokenCount - 1, hiddenSize));
+        break;
+      case "mean":
+        results.push(meanPoolAt(data, offset, tokenCount, hiddenSize, mask1d));
+        break;
+    }
+  }
+
+  return results;
+}
+
 function sliceToken(
   data: ArrayLike<number>,
   tokenIndex: number,
   hiddenSize: number,
 ): number[] {
-  const start = tokenIndex * hiddenSize;
+  return sliceTokenAt(data, 0, tokenIndex, hiddenSize);
+}
+
+function sliceTokenAt(
+  data: ArrayLike<number>,
+  baseOffset: number,
+  tokenIndex: number,
+  hiddenSize: number,
+): number[] {
+  const start = baseOffset + tokenIndex * hiddenSize;
   const result = new Array<number>(hiddenSize);
   for (let i = 0; i < hiddenSize; i += 1) {
     result[i] = data[start + i];
@@ -797,13 +880,23 @@ function meanPool(
   hiddenSize: number,
   mask?: ArrayLike<number>,
 ): number[] {
+  return meanPoolAt(data, 0, tokenCount, hiddenSize, mask);
+}
+
+function meanPoolAt(
+  data: ArrayLike<number>,
+  baseOffset: number,
+  tokenCount: number,
+  hiddenSize: number,
+  mask?: ArrayLike<number>,
+): number[] {
   const result = new Array<number>(hiddenSize).fill(0);
   let maskSum = 0;
   for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
     const weight = mask ? mask[tokenIndex] : 1;
     if (weight === 0) continue;
     maskSum += weight;
-    const offset = tokenIndex * hiddenSize;
+    const offset = baseOffset + tokenIndex * hiddenSize;
     for (let i = 0; i < hiddenSize; i += 1) {
       result[i] += data[offset + i] * weight;
     }

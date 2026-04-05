@@ -77,23 +77,43 @@ function successfulFetch(): typeof globalThis.fetch {
   }) as unknown as typeof globalThis.fetch;
 }
 
+/**
+ * Build a mock transformers module.  `tensor` describes the output for a
+ * *single* input.  When the tokenizer receives a batch of N inputs the
+ * model's forward() automatically replicates the per-element data N times
+ * so the output tensor has the correct batch dimension.
+ */
 function makeTransformersModule(
   tensor: { dims: number[]; data: number[] },
   capture: { inputs: string[][] },
 ) {
+  let lastBatchSize = 1;
   const tokenizer = jest.fn(
     async (input: string | string[]) => {
-      capture.inputs.push(Array.isArray(input) ? input : [input]);
+      const arr = Array.isArray(input) ? input : [input];
+      capture.inputs.push(arr);
+      lastBatchSize = arr.length;
       return {};
     },
   );
   const model = {
-    forward: jest.fn(async () => ({
-      last_hidden_state: {
-        dims: tensor.dims,
-        data: Float32Array.from(tensor.data),
-      },
-    })),
+    forward: jest.fn(async () => {
+      // Replicate per-element data for the batch.
+      const batchData =
+        lastBatchSize === 1
+          ? tensor.data
+          : Array.from({ length: lastBatchSize }, () => tensor.data).flat();
+      const batchDims =
+        tensor.dims.length === 3
+          ? [lastBatchSize, tensor.dims[1], tensor.dims[2]]
+          : tensor.dims;
+      return {
+        last_hidden_state: {
+          dims: batchDims,
+          data: Float32Array.from(batchData),
+        },
+      };
+    }),
   };
 
   return {
@@ -423,7 +443,8 @@ describe("@lancedb/lancedb-web/transformers", () => {
 
     const result = await embedMany({ values: ["a", "b", "c"] });
     expect(result.embeddings).toHaveLength(3);
-    expect(capture.inputs).toEqual([["a"], ["b"], ["c"]]);
+    // Batch tokenize+forward: single call with all values
+    expect(capture.inputs).toEqual([["a", "b", "c"]]);
   });
 
   it("embedMany() with EmbeddingModel object", async () => {
