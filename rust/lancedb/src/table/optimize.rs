@@ -88,19 +88,6 @@ pub enum OptimizeAction {
     /// For example, when using IVF, an index will create clusters.  Optimizing an index assigns unindexed
     /// data to the existing clusters, but it does not move the clusters or create new clusters.
     Index(OptimizeOptions),
-    /// Compact index segments to favor search latency over indexing throughput.
-    ///
-    /// This is a search-oriented mode. Unlike [`OptimizeAction::Index`], which is a good
-    /// default for incrementally keeping indices up to date as new data arrives, this mode
-    /// merges as many existing index segments as the table currently has and produces a more
-    /// compact search-time layout.
-    ///
-    /// Use this when you are preparing a table for read-heavy serving, static publishing, or
-    /// browser / edge delivery and you want searches to touch as few index segments as possible.
-    ///
-    /// This mode does not retrain the index. It compacts existing index state for better search
-    /// execution instead of optimizing indexing throughput.
-    IndexCompact(OptimizeOptions),
 }
 
 /// Statistics about the optimization.
@@ -155,6 +142,17 @@ async fn search_compact_index_options(
         .num_indices_to_merge(Some(num_indices_to_merge));
     compact_options.retrain = false;
     Ok(compact_options)
+}
+
+/// Optimize indices for read-heavy serving by compacting as many index segments
+/// as currently exist for the selected indices.
+pub(crate) async fn optimize_indices_for_search(
+    table: &NativeTable,
+    options: OptimizeOptions,
+) -> Result<OptimizeStats> {
+    let compact_options = search_compact_index_options(table, &options).await?;
+    optimize_indices(table, &compact_options).await?;
+    Ok(OptimizeStats::default())
 }
 
 /// Remove old versions of the dataset from disk.
@@ -253,10 +251,6 @@ pub(crate) async fn execute_optimize(
         }
         OptimizeAction::Index(options) => {
             optimize_indices(table, &options).await?;
-        }
-        OptimizeAction::IndexCompact(options) => {
-            let compact_options = search_compact_index_options(table, &options).await?;
-            optimize_indices(table, &compact_options).await?;
         }
     }
     Ok(stats)
@@ -553,7 +547,7 @@ mod tests {
         table.add(batch).execute().await.unwrap();
 
         table
-            .optimize(OptimizeAction::IndexCompact(Default::default()))
+            .optimize_indices_for_search(Default::default())
             .await
             .unwrap();
 
@@ -834,7 +828,6 @@ mod tests {
         error_if_tagged_old_versions: None,
     })]
     #[case::index(OptimizeAction::Index(Default::default()))]
-    #[case::index_compact(OptimizeAction::IndexCompact(Default::default()))]
     #[tokio::test]
     async fn test_optimize_fails_on_checked_out_table(#[case] action: OptimizeAction) {
         let conn = connect("memory://").execute().await.unwrap();
@@ -857,6 +850,38 @@ mod tests {
         table.checkout(1).await.unwrap();
 
         let result = table.optimize(action).await;
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cannot be modified when a specific version is checked out"),
+            "Expected error message about checked out table, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_indices_for_search_fails_on_checked_out_table() {
+        let conn = connect("memory://").execute().await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+
+        let table = conn
+            .create_table("test_checkout_optimize_for_search", batch.clone())
+            .execute()
+            .await
+            .unwrap();
+
+        table.add(batch).execute().await.unwrap();
+
+        table.checkout(1).await.unwrap();
+
+        let result = table.optimize_indices_for_search(Default::default()).await;
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();
