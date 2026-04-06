@@ -90,6 +90,7 @@ pub struct ObjectStoreRegistryStats {
 /// - `file`: A local file object store, with optimized code paths.
 /// - `file-object-store`: A local file object store that uses the ObjectStore API,
 ///   for all operations. Used for testing with ObjectStore wrappers.
+/// - `file+uring`: A local file object store using io_uring (Linux only).
 /// - `s3`: An S3 object store.
 /// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
 /// - `az`: An Azure Blob Storage object store.
@@ -293,18 +294,19 @@ impl Default for ObjectStoreRegistry {
 
         providers.insert("memory".into(), Arc::new(memory::MemoryStoreProvider));
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            providers.insert("file".into(), Arc::new(local::FileStoreProvider));
-            // The "file" scheme has special optimized code paths that bypass
-            // the ObjectStore API for better performance. However, this can make it
-            // hard to test when using ObjectStore wrappers, such as IOTrackingStore.
-            // So we provide a "file-object-store" scheme that uses the ObjectStore API.
-            // The specialized code paths are differentiated by the scheme name.
-            providers.insert(
-                "file-object-store".into(),
-                Arc::new(local::FileStoreProvider),
-            );
-        }
+        providers.insert("file".into(), Arc::new(local::FileStoreProvider));
+        // The "file" scheme has special optimized code paths that bypass
+        // the ObjectStore API for better performance. However, this can make it
+        // hard to test when using ObjectStore wrappers, such as IOTrackingStore.
+        // So we provide a "file-object-store" scheme that uses the ObjectStore API.
+        // The specialized code paths are differentiated by the scheme name.
+        #[cfg(not(target_arch = "wasm32"))]
+        providers.insert(
+            "file-object-store".into(),
+            Arc::new(local::FileStoreProvider),
+        );
+        #[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
+        providers.insert("file+uring".into(), Arc::new(local::FileStoreProvider));
 
         #[cfg(feature = "aws")]
         {

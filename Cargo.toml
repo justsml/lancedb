@@ -15,7 +15,7 @@ exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
-version = "4.0.0-rc.3"
+version = "5.0.0-beta.5"
 edition = "2024"
 authors = ["LanceDB Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -27,20 +27,20 @@ categories = ["database-implementations"]
 rust-version = "1.91.0"
 
 [workspace.dependencies]
-lance = { "version" = "=4.0.0-rc.3", default-features = false, "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-core = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-datagen = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-file = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-io = { "version" = "=4.0.0-rc.3", default-features = false, "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-index = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-linalg = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-namespace = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-namespace-impls = { "version" = "=4.0.0-rc.3", default-features = false, "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-table = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-testing = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-datafusion = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-encoding = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
-lance-arrow = { "version" = "=4.0.0-rc.3", "tag" = "v4.0.0-rc.3", "git" = "https://github.com/lance-format/lance.git" }
+lance = { "version" = "=5.0.0-beta.5", default-features = false, "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-core = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-datagen = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-file = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-io = { "version" = "=5.0.0-beta.5", default-features = false, "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-index = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-linalg = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-namespace = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-namespace-impls = { "version" = "=5.0.0-beta.5", default-features = false, "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-table = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-testing = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-datafusion = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-encoding = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
+lance-arrow = { "version" = "=5.0.0-beta.5", "tag" = "v5.0.0-beta.5", "git" = "https://github.com/lance-format/lance.git" }
 ahash = "0.8"
 # Note that this one does not include pyarrow
 arrow = { version = "57.2", optional = false }
@@ -73,7 +73,7 @@ datafusion-sql = "52.1"
 deepsize = "0.2.0"
 criterion = { version = "0.5", features = ["async", "async_tokio", "html_reports"] }
 env_logger = "0.11"
-fsst = { version = "=4.0.0-rc.3", tag = "v4.0.0-rc.3", git = "https://github.com/lance-format/lance.git", package = "fsst" }
+fsst = { version = "=5.0.0-beta.5", tag = "v5.0.0-beta.5", git = "https://github.com/lance-format/lance.git", package = "fsst" }
 half = { "version" = "2.7.1", default-features = false, features = [
     "num-traits",
 ] }
@@ -84,7 +84,7 @@ hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
 libc = "0.2.176"
 log = "0.4"
-lance-bitpacking = { version = "=4.0.0-rc.3", tag = "v4.0.0-rc.3", git = "https://github.com/lance-format/lance.git", package = "lance-bitpacking" }
+lance-bitpacking = { version = "=5.0.0-beta.5", tag = "v5.0.0-beta.5", git = "https://github.com/lance-format/lance.git", package = "lance-bitpacking" }
 mock_instant = "0.6.0"
 mockall = "0.13.1"
 moka = { version = "0.12", features = ["future"] }
@@ -92,6 +92,7 @@ num_cpus = "1.0"
 object_store = "0.12.0"
 object_store_opendal = "0.55"
 opendal = "0.55"
+io-uring = "0.7"
 path_abs = "0.5"
 pin-project = "1.0.7"
 pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
@@ -105,6 +106,7 @@ rand_xoshiro = "0.7"
 rangemap = "1.0"
 roaring = "0.11"
 rstest = "0.23.0"
+serial_test = "3"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 snafu = "0.8"

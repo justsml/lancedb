@@ -1,26 +1,15 @@
 [package]
 name = "lance-table"
-version = "4.0.0-rc.3"
-edition = "2024"
-authors = ["Lance Devs <dev@lance.org>"]
-license = "Apache-2.0"
-repository = "https://github.com/lance-format/lance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 readme = "README.md"
 description = "Utilities for the Lance table format"
-keywords = [
-    "data-format",
-    "data-science",
-    "machine-learning",
-    "apache-arrow",
-    "data-analytics",
-]
-categories = [
-    "database-implementations",
-    "data-structures",
-    "development-tools",
-    "science",
-]
-rust-version = "1.91.0"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 lance-arrow.workspace = true
@@ -61,19 +50,32 @@ tokio.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.23", default-features = false, features = ["io-util", "macros", "rt", "sync", "time"] }
 
-[build-dependencies]
-prost-build.workspace = true
-protobuf-src = { version = "2.1", optional = true }
-
 [dev-dependencies]
 lance-datagen.workspace = true
+arrow-schema.workspace = true
+criterion.workspace = true
 pretty_assertions.workspace = true
 proptest.workspace = true
 rstest.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof = { workspace = true }
+
+[build-dependencies]
+prost-build.workspace = true
+protobuf-src = { version = "2.1", optional = true }
 
 [features]
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-credential-types", "lance-io/aws"]
 protoc = ["dep:protobuf-src"]
 
 [package.metadata.docs.rs]
+# docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
 features = ["protoc"]
+
+[[bench]]
+name = "row_id_index"
+harness = false
+
+[lints]
+workspace = true

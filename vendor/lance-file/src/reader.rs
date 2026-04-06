@@ -1535,7 +1535,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 
     use arrow_array::{

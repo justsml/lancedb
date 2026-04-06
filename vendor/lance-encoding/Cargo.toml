@@ -1,26 +1,15 @@
 [package]
 name = "lance-encoding"
-version = "4.0.0-rc.3"
-edition = "2024"
-authors = ["Lance Devs <dev@lance.org>"]
-license = "Apache-2.0"
-repository = "https://github.com/lance-format/lance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 readme = "README.md"
 description = "Encoders and decoders for the Lance file format"
-keywords = [
-    "data-format",
-    "data-science",
-    "machine-learning",
-    "apache-arrow",
-    "data-analytics",
-]
-categories = [
-    "database-implementations",
-    "data-structures",
-    "development-tools",
-    "science",
-]
-rust-version = "1.91.0"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 lance-arrow.workspace = true
@@ -61,17 +50,24 @@ tokio = { version = "1.23", default-features = false, features = ["io-util", "ma
 lz4 = { package = "lz4_flex", version = "0.12", optional = true }
 zstd = { package = "ruzstd", version = "0.8.2", optional = true }
 
+[dev-dependencies]
+lance-testing.workspace = true
+lance-datagen.workspace = true
+arrow-ord.workspace = true
+rand.workspace = true
+rstest.workspace = true
+test-log.workspace = true
+criterion = { workspace = true }
+rand_xoshiro = { workspace = true }
+proptest.workspace = true
+serial_test.workspace = true
+
 [build-dependencies]
 prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
 
-[dev-dependencies]
-arrow-ord.workspace = true
-lance-datagen.workspace = true
-proptest.workspace = true
-rand_xoshiro.workspace = true
-rstest.workspace = true
-test-log.workspace = true
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof = { workspace = true }
 
 [features]
 default = ["lz4", "zstd", "bitpacking"]
@@ -81,4 +77,20 @@ lz4 = ["dep:lz4"]
 zstd = ["dep:zstd"]
 
 [package.metadata.docs.rs]
+# docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
 features = ["protoc"]
+
+[[bench]]
+name = "decoder"
+harness = false
+
+[[bench]]
+name = "encoder"
+harness = false
+
+[[bench]]
+name = "buffer"
+harness = false
+
+[lints]
+workspace = true
