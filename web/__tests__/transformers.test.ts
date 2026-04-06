@@ -10,6 +10,37 @@ import {
 } from "../src/transformers";
 import type { WasmRemoteSearchHandle } from "../src/generated/lancedb_wasm";
 
+type FetchFn = typeof globalThis.fetch;
+type FetchInput = Parameters<FetchFn>[0];
+type FetchInit = Parameters<FetchFn>[1];
+
+interface PublishedMetadataFixture {
+  version: number;
+  manifestPath: string;
+  manifestNamingScheme: string;
+  latestManifestPath: string;
+  latestVersionPath: string;
+  webMetadataPath: string;
+  snapshotPath: string;
+  vectorColumns: string[];
+  ftsColumns: string[];
+  defaultVectorColumn?: string;
+}
+
+interface PublishedSnapshotFixture extends PublishedMetadataFixture {
+  isComplete: boolean;
+}
+
+function createFetch(
+  handler: (
+    input: FetchInput,
+    init?: FetchInit,
+  ) => Promise<Response> | Response,
+): FetchFn {
+  return async (input: FetchInput, init?: FetchInit) =>
+    await handler(input, init);
+}
+
 function makeArrowIpc() {
   return tableToIPC(
     tableFromArrays({
@@ -29,7 +60,9 @@ function makeHandle(): jest.Mocked<WasmRemoteSearchHandle> {
   };
 }
 
-function publishedMetadata(overrides: Partial<Record<string, unknown>> = {}) {
+function publishedMetadata(
+  overrides: Partial<PublishedMetadataFixture> = {},
+): PublishedMetadataFixture {
   return {
     version: 7,
     manifestPath: "_versions/7.manifest",
@@ -45,7 +78,9 @@ function publishedMetadata(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
-function publishedSnapshot(overrides: Partial<Record<string, unknown>> = {}) {
+function publishedSnapshot(
+  overrides: Partial<PublishedSnapshotFixture> = {},
+): PublishedSnapshotFixture {
   return {
     ...publishedMetadata(),
     isComplete: true,
@@ -53,8 +88,8 @@ function publishedSnapshot(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
-function successfulFetch(): typeof globalThis.fetch {
-  return (async (input: RequestInfo | URL) => {
+function successfulFetch(): FetchFn {
+  return createFetch(async (input) => {
     const url = input.toString();
     if (url.endsWith("/_web.json")) {
       return Response.json(publishedMetadata());
@@ -74,7 +109,7 @@ function successfulFetch(): typeof globalThis.fetch {
       });
     }
     throw new Error(`unexpected fetch ${url}`);
-  }) as unknown as typeof globalThis.fetch;
+  });
 }
 
 /**
@@ -106,6 +141,8 @@ function makeTransformersModule(
       const batchDims =
         tensor.dims.length === 3
           ? [lastBatchSize, tensor.dims[1], tensor.dims[2]]
+          : tensor.dims.length === 2
+            ? [lastBatchSize, tensor.dims[1]]
           : tensor.dims;
       return {
         last_hidden_state: {
@@ -444,6 +481,27 @@ describe("@lancedb/lancedb-web/transformers", () => {
     const result = await embedMany({ values: ["a", "b", "c"] });
     expect(result.embeddings).toHaveLength(3);
     // Batch tokenize+forward: single call with all values
+    expect(capture.inputs).toEqual([["a", "b", "c"]]);
+  });
+
+  it("embedMany() handles batched 2D pooled outputs", async () => {
+    const capture = { inputs: [] as string[][] };
+    const transformers = makeTransformersModule(
+      { dims: [1, 2], data: [3, 4] },
+      capture,
+    );
+    __setTransformersModuleLoaderForTests(async () => transformers);
+
+    const model = transformersEmbedder({
+      normalize: false,
+    });
+    const result = await model.embedMany(["a", "b", "c"]);
+
+    expect(result.embeddings).toEqual([
+      [3, 4],
+      [3, 4],
+      [3, 4],
+    ]);
     expect(capture.inputs).toEqual([["a", "b", "c"]]);
   });
 

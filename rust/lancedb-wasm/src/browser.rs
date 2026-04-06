@@ -193,25 +193,25 @@ impl BrowserTable {
                 sort_by_text_score,
             ),
             SearchMode::Hybrid(plan) => {
+                let requested_limit = limit.unwrap_or(DEFAULT_VECTOR_LIMIT);
+                let fusion_window = requested_limit.saturating_add(offset);
                 let ranked_vector = finalize_hybrid_source_rows(
                     vector_rows,
-                    limit.unwrap_or(DEFAULT_VECTOR_LIMIT),
-                    offset,
+                    fusion_window,
                     filter_expr.is_some() && !prefilter,
                     sort_vector_rows(plan.distance_type),
                 );
                 let ranked_text = finalize_hybrid_source_rows(
                     text_rows,
-                    limit.unwrap_or(DEFAULT_VECTOR_LIMIT),
-                    offset,
+                    fusion_window,
                     filter_expr.is_some() && !prefilter,
                     sort_by_text_score,
                 );
-                combine_hybrid_rows(
-                    ranked_vector,
-                    ranked_text,
-                    limit.unwrap_or(DEFAULT_VECTOR_LIMIT),
-                )?
+                apply_offset_limit(
+                    combine_hybrid_rows(ranked_vector, ranked_text, fusion_window)?,
+                    Some(requested_limit),
+                    offset,
+                )
             }
         };
 
@@ -980,14 +980,12 @@ fn finalize_ranked_rows(
 
 fn finalize_hybrid_source_rows(
     mut rows: Vec<ResultRow>,
-    limit: usize,
-    offset: usize,
+    window: usize,
     postfilter: bool,
     comparator: impl Fn(&ResultRow, &ResultRow) -> Ordering,
 ) -> Vec<ResultRow> {
     rows.sort_by(comparator);
-    let window = limit.saturating_add(offset);
-    let rows = if postfilter {
+    let mut rows = if postfilter {
         take_window(rows, Some(window))
             .into_iter()
             .filter(|row| row.filter_pass)
@@ -997,7 +995,10 @@ fn finalize_hybrid_source_rows(
             .filter(|row| row.filter_pass)
             .collect::<Vec<_>>()
     };
-    apply_offset_limit(rows, Some(limit), offset)
+    if !postfilter {
+        rows.truncate(window);
+    }
+    rows
 }
 
 fn take_window(rows: Vec<ResultRow>, window: Option<usize>) -> Vec<ResultRow> {
@@ -1614,5 +1615,51 @@ mod tests {
             .value(0);
         assert_eq!(id2, 2);
         assert_eq!(score_plus, 2);
+    }
+
+    #[test]
+    fn hybrid_pagination_applies_offset_after_fusion() {
+        let empty_batch = Arc::new(RecordBatch::new_empty(Arc::new(Schema::empty())));
+        let make_row = |row_id: u64,
+                        ordinal: u64,
+                        distance: Option<f32>,
+                        text_score: Option<f32>|
+         -> ResultRow {
+            ResultRow {
+                ordinal,
+                batch: empty_batch.clone(),
+                row_index: 0,
+                row_id: Some(row_id),
+                filter_pass: true,
+                distance,
+                text_score,
+                relevance_score: None,
+            }
+        };
+
+        let ranked_vector = finalize_hybrid_source_rows(
+            vec![
+                make_row(10, 0, Some(0.0), None),
+                make_row(20, 1, Some(1.0), None),
+            ],
+            2,
+            false,
+            sort_by_distance,
+        );
+        let ranked_text = finalize_hybrid_source_rows(
+            vec![
+                make_row(20, 1, None, Some(10.0)),
+                make_row(10, 0, None, Some(9.0)),
+            ],
+            2,
+            false,
+            sort_by_text_score,
+        );
+
+        let fused = combine_hybrid_rows(ranked_vector, ranked_text, 2).unwrap();
+        let page = apply_offset_limit(fused, Some(1), 1);
+
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].row_id, Some(20));
     }
 }

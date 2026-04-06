@@ -505,8 +505,11 @@ async fn resolve_published_state(
                 .unwrap_or(SNAPSHOT_PATH),
         )
     });
-    let snapshot =
-        fetch_optional_json::<PublishedSnapshot>(&snapshot_url, &options.headers).await?;
+    let snapshot = if table_metadata.is_none() {
+        fetch_optional_json::<PublishedSnapshot>(&snapshot_url, &options.headers).await?
+    } else {
+        None
+    };
 
     Ok(ResolvedPublishedState {
         current_version: table_metadata

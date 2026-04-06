@@ -696,11 +696,14 @@ async function resolvePublishedState(
     tableUrl,
     tableMetadata?.snapshotPath ?? "_snapshot.json",
   );
-  const snapshot = await fetchJsonIfExists<PublishedSnapshot>(
-    snapshotUrl,
-    headers,
-    options,
-  );
+  const snapshot =
+    tableMetadata === null
+      ? await fetchJsonIfExists<PublishedSnapshot>(
+          snapshotUrl,
+          headers,
+          options,
+        )
+      : null;
 
   return {
     currentVersion: tableMetadata?.version ?? snapshot?.version ?? null,

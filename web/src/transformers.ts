@@ -643,7 +643,6 @@ class TextEmbeddingSearchTableImpl implements TextEmbeddingSearchTable {
 async function defaultTransformersModuleLoader(): Promise<TransformersModule> {
   // The variable indirection plus bundler-specific comments prevent bundlers
   // from statically resolving the import, keeping @huggingface/transformers
-  // a true optional peer dependency — without requiring `unsafe-eval` CSP.
   const specifier = "@huggingface/transformers";
   try {
     return await import(/* webpackIgnore: true */ /* @vite-ignore */ specifier);
@@ -783,8 +782,10 @@ function poolTensor(
 }
 
 /**
- * Pool a multi-batch 3D tensor `[batchSize, tokenCount, hiddenSize]` into one
- * embedding per batch element.
+ * Convert a batched tensor into one embedding per batch element.
+ *
+ * Supports already pooled 2D tensors `[batchSize, hiddenSize]` and token-level
+ * 3D tensors `[batchSize, tokenCount, hiddenSize]`.
  */
 function poolBatchTensor(
   tensor: TensorLike,
@@ -792,10 +793,26 @@ function poolBatchTensor(
   batchSize: number,
   attentionMask?: TensorLike,
 ): number[][] {
-  // For 1D or 2D outputs, batch isn't encoded in the shape — fall back to
-  // single-element pooling (caller should have used poolTensor instead).
-  if (tensor.dims.length < 3) {
-    return [poolTensor(tensor, pooling, attentionMask)];
+  // Some models return already pooled embeddings shaped as [batchSize, hiddenSize].
+  if (tensor.dims.length === 2) {
+    const [rows, hiddenSize] = tensor.dims;
+    if (rows !== batchSize) {
+      throw new Error(
+        `Unsupported batched 2D tensor shape [${tensor.dims.join(", ")}]. Expected first dimension to match batch size ${batchSize}.`,
+      );
+    }
+    const data = tensor.data;
+    const results: number[][] = [];
+    for (let rowIndex = 0; rowIndex < rows; rowIndex += 1) {
+      results.push(sliceTokenAt(data, rowIndex * hiddenSize, 0, hiddenSize));
+    }
+    return results;
+  }
+
+  if (tensor.dims.length < 2) {
+    throw new Error(
+      `Unsupported batched embedding tensor shape [${tensor.dims.join(", ")}]. Expected 2D or 3D output.`,
+    );
   }
 
   const tokenCount = tensor.dims[1];

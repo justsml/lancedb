@@ -122,18 +122,20 @@ impl CommitHandler for WebPublishCommitHandler {
         base_path: &Path,
         object_store: &lance_io::object_store::ObjectStore,
     ) -> lance_core::Result<ManifestLocation> {
-        let path = base_path.child(LATEST_MANIFEST_PATH);
-        match object_store.inner.head(&path).await {
-            Ok(meta) => {
-                let manifest = read_manifest(object_store, &path, Some(meta.size)).await?;
-                Ok(manifest_location_from_latest_copy(path, meta, &manifest))
-            }
-            Err(object_store::Error::NotFound { .. }) => {
-                self.inner
-                    .resolve_latest_location(base_path, object_store)
-                    .await
-            }
-            Err(source) => Err(source.into()),
+        let latest_copy = resolve_latest_copy_location(base_path, object_store).await?;
+        let inner_latest = self
+            .inner
+            .resolve_latest_location(base_path, object_store)
+            .await;
+
+        match (latest_copy, inner_latest) {
+            (Some(copy), Ok(inner)) => Ok(if inner.version > copy.version {
+                inner
+            } else {
+                copy
+            }),
+            (Some(copy), Err(_)) => Ok(copy),
+            (None, result) => result,
         }
     }
 
@@ -261,6 +263,23 @@ pub(crate) async fn patch_write_params(uri: &str, mut params: WriteParams) -> Re
 
 pub(crate) fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler> {
     Arc::new(WebPublishCommitHandler::new(inner))
+}
+
+async fn resolve_latest_copy_location(
+    base_path: &Path,
+    object_store: &lance_io::object_store::ObjectStore,
+) -> lance_core::Result<Option<ManifestLocation>> {
+    let path = base_path.child(LATEST_MANIFEST_PATH);
+    match object_store.inner.head(&path).await {
+        Ok(meta) => {
+            let manifest = read_manifest(object_store, &path, Some(meta.size)).await?;
+            Ok(Some(manifest_location_from_latest_copy(
+                path, meta, &manifest,
+            )))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(source) => Err(source.into()),
+    }
 }
 
 fn stamp_manifest_metadata(
@@ -840,5 +859,30 @@ mod tests {
 
         let reopened = NativeTable::open(root.to_str().unwrap()).await.unwrap();
         assert_eq!(reopened.count_rows(None).await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn ignores_stale_latest_manifest_copy_when_newer_manifest_exists() {
+        let dir = tempdir().unwrap();
+        let db = connect(dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        let table = db
+            .create_table("published", make_batch(0, 4))
+            .execute()
+            .await
+            .unwrap();
+
+        let root = table_root(dir.path());
+        let stale_manifest = fs::read(root.join(LATEST_MANIFEST_PATH)).unwrap();
+
+        table.add(make_batch(10, 2)).execute().await.unwrap();
+
+        fs::write(root.join(LATEST_MANIFEST_PATH), stale_manifest).unwrap();
+
+        let reopened = NativeTable::open(root.to_str().unwrap()).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 6);
     }
 }

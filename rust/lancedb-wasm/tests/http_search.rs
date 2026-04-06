@@ -276,7 +276,7 @@ async fn opens_reads_schema_and_searches_over_http() {
             .any(|request| request.path.ends_with("/search_table.lance/_web.json"))
     );
     assert!(
-        requests
+        !requests
             .iter()
             .any(|request| request.path.ends_with("/search_table.lance/_snapshot.json"))
     );
@@ -385,7 +385,7 @@ async fn published_http_smoke_path_covers_open_search_refresh() {
             .any(|request| request.path.ends_with("/search_table.lance/_web.json"))
     );
     assert!(
-        requests
+        !requests
             .iter()
             .any(|request| request.path.ends_with("/search_table.lance/_snapshot.json"))
     );

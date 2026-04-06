@@ -8,6 +8,48 @@ import {
 import type { WasmRemoteSearchHandle } from "../src/generated/lancedb_wasm";
 import type { WorkerRequest, WorkerResponse } from "../src/worker_protocol";
 
+type FetchFn = typeof globalThis.fetch;
+type FetchInput = Parameters<FetchFn>[0];
+type FetchInit = Parameters<FetchFn>[1];
+
+interface PublishedMetadataFixture {
+  version: number;
+  manifestPath: string;
+  manifestNamingScheme: string;
+  latestManifestPath: string;
+  latestVersionPath: string;
+  webMetadataPath: string;
+  snapshotPath: string;
+  vectorColumns: string[];
+  ftsColumns: string[];
+  defaultVectorColumn?: string;
+}
+
+interface PublishedSnapshotFixture extends PublishedMetadataFixture {
+  isComplete: boolean;
+}
+
+function createFetch(
+  handler: (
+    input: FetchInput,
+    init?: FetchInit,
+  ) => Promise<Response> | Response,
+): FetchFn {
+  return async (input: FetchInput, init?: FetchInit) =>
+    await handler(input, init);
+}
+
+function createFetchMock(
+  handler: (
+    input: FetchInput,
+    init?: FetchInit,
+  ) => Promise<Response> | Response,
+): jest.MockedFunction<FetchFn> {
+  return jest.fn<ReturnType<FetchFn>, Parameters<FetchFn>>(
+    async (input, init) => await handler(input, init),
+  );
+}
+
 function makeArrowIpc() {
   return tableToIPC(
     tableFromArrays({
@@ -27,7 +69,9 @@ function makeHandle(): jest.Mocked<WasmRemoteSearchHandle> {
   };
 }
 
-function publishedMetadata(overrides: Partial<Record<string, unknown>> = {}) {
+function publishedMetadata(
+  overrides: Partial<PublishedMetadataFixture> = {},
+): PublishedMetadataFixture {
   return {
     version: 7,
     manifestPath: "_versions/7.manifest",
@@ -43,7 +87,9 @@ function publishedMetadata(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
-function publishedSnapshot(overrides: Partial<Record<string, unknown>> = {}) {
+function publishedSnapshot(
+  overrides: Partial<PublishedSnapshotFixture> = {},
+): PublishedSnapshotFixture {
   return {
     ...publishedMetadata(),
     isComplete: true,
@@ -68,7 +114,7 @@ describe("@lancedb/lancedb-web", () => {
       open_table: openTableMock,
     }));
 
-    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = createFetchMock(async (input) => {
       const url = input.toString();
       if (url.endsWith("/_web.json")) {
         return Response.json(publishedMetadata());
@@ -88,7 +134,7 @@ describe("@lancedb/lancedb-web", () => {
     });
 
     await openTable("https://example.com/search_table.lance", {
-      fetch: fetchMock as unknown as typeof globalThis.fetch,
+      fetch: fetchMock,
       headers: { Authorization: "Bearer token" },
       cacheBytes: 4096,
     });
@@ -102,14 +148,9 @@ describe("@lancedb/lancedb-web", () => {
         }),
       }),
     );
-    expect(fetchMock).toHaveBeenCalledWith(
+    expect(fetchMock).not.toHaveBeenCalledWith(
       "https://example.com/search_table.lance/_snapshot.json",
-      expect.objectContaining({
-        method: "GET",
-        headers: expect.objectContaining({
-          Authorization: "Bearer token",
-        }),
-      }),
+      expect.anything(),
     );
     expect(fetchMock).toHaveBeenCalledWith(
       "https://example.com/search_table.lance/_latest.manifest",
@@ -330,6 +371,52 @@ describe("@lancedb/lancedb-web", () => {
     expect(openTableMock).toHaveBeenCalledTimes(1);
   });
 
+  it("falls back to snapshot metadata when _web.json is missing", async () => {
+    const handle = makeHandle();
+    const openTableMock = jest.fn<
+      Promise<WasmRemoteSearchHandle>,
+      [string, string | undefined]
+    >(async () => handle);
+    __setWasmModuleLoaderForTests(async () => ({
+      open_table: openTableMock,
+    }));
+
+    const fetchMock = createFetchMock(async (input) => {
+      const url = input.toString();
+      if (url.endsWith("/_web.json")) {
+        return new Response(null, { status: 404 });
+      }
+      if (url.endsWith("/_snapshot.json")) {
+        return Response.json(publishedSnapshot());
+      }
+      if (url.endsWith("/_latest.manifest")) {
+        return new Response(new Uint8Array([1]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-0/1",
+          },
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+
+    const table = await openTable("https://example.com/search_table.lance", {
+      fetch: fetchMock,
+    });
+    await table.search({ vector: new Float32Array([0, 1]) });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://example.com/search_table.lance/_snapshot.json",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(handle.search).toHaveBeenCalledWith(
+      JSON.stringify({
+        vector: [0, 1],
+        vectorColumn: "embedding",
+      }),
+    );
+  });
+
   it("does not apply the worker init timeout to search requests", async () => {
     jest.spyOn(globalThis, "fetch").mockImplementation(successfulFetch());
 
@@ -372,13 +459,13 @@ describe("@lancedb/lancedb-web", () => {
 
     await expect(
       openTable("https://example.com/search_table.lance", {
-        fetch: (async (input: RequestInfo | URL) => {
+        fetch: createFetch(async (input) => {
           const url = input.toString();
           if (url.endsWith("/_web.json") || url.endsWith("/_snapshot.json")) {
             return new Response(null, { status: 404 });
           }
           return new Response(null, { status: 200 });
-        }) as unknown as typeof globalThis.fetch,
+        }),
       }),
     ).rejects.toThrow(/Expected status 206/);
   });
@@ -390,19 +477,19 @@ describe("@lancedb/lancedb-web", () => {
 
     await expect(
       openTable("https://example.com/search_table.lance", {
-        fetch: (async (input: RequestInfo | URL) => {
+        fetch: createFetch(async (input) => {
           const url = input.toString();
           if (url.endsWith("/_web.json") || url.endsWith("/_snapshot.json")) {
             return new Response(null, { status: 404 });
           }
           return new Response(new Uint8Array([1]), { status: 206 });
-        }) as unknown as typeof globalThis.fetch,
+        }),
       }),
     ).rejects.toThrow(/Content-Range header/);
   });
 });
 
-function successfulFetch(): typeof globalThis.fetch {
+function successfulFetch(): FetchFn {
   return sidecarFetch();
 }
 
@@ -412,10 +499,10 @@ function sidecarFetch({
   snapshot = publishedSnapshot(),
 }: {
   latestVersion?: string;
-  metadata?: Record<string, unknown>;
-  snapshot?: Record<string, unknown>;
-} = {}): typeof globalThis.fetch {
-  return (async (input: RequestInfo | URL) => {
+  metadata?: PublishedMetadataFixture;
+  snapshot?: PublishedSnapshotFixture;
+} = {}): FetchFn {
+  return createFetch(async (input) => {
     const url = input.toString();
     if (url.endsWith("/_web.json")) {
       return Response.json(metadata);
@@ -435,7 +522,7 @@ function sidecarFetch({
       });
     }
     throw new Error(`unexpected fetch ${url}`);
-  }) as unknown as typeof globalThis.fetch;
+  });
 }
 
 function makeWorker(
