@@ -381,6 +381,8 @@ class LanceNamespaceDBConnection(DBConnection):
         storage_options: Optional[Dict[str, str]] = None,
         session: Optional[Session] = None,
         namespace_client_pushdown_operations: Optional[List[str]] = None,
+        namespace_client_impl: Optional[str] = None,
+        namespace_client_properties: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize a namespace-based LanceDB connection.
@@ -406,12 +408,43 @@ class LanceNamespaceDBConnection(DBConnection):
               namespace.create_table() instead of using declare_table + local write.
 
             Default is None (no pushdown, all operations run locally).
+        namespace_client_impl : Optional[str]
+            The namespace implementation name used to create this connection.
+            Stored for serialization purposes.
+        namespace_client_properties : Optional[Dict[str, str]]
+            The namespace properties used to create this connection.
+            Stored for serialization purposes.
         """
         self._namespace_client = namespace_client
         self.read_consistency_interval = read_consistency_interval
         self.storage_options = storage_options or {}
         self.session = session
-        self._pushdown_operations = set(namespace_client_pushdown_operations or [])
+        self._namespace_client_pushdown_operations = set(
+            namespace_client_pushdown_operations or []
+        )
+        self._namespace_client_impl = namespace_client_impl
+        self._namespace_client_properties = namespace_client_properties
+
+    @override
+    def serialize(self) -> str:
+        import json
+
+        return json.dumps(
+            {
+                "connection_type": "namespace",
+                "namespace_client_impl": self._namespace_client_impl,
+                "namespace_client_properties": self._namespace_client_properties,
+                "namespace_client_pushdown_operations": sorted(
+                    self._namespace_client_pushdown_operations
+                ),
+                "storage_options": self.storage_options or None,
+                "read_consistency_interval_seconds": (
+                    self.read_consistency_interval.total_seconds()
+                    if self.read_consistency_interval
+                    else None
+                ),
+            }
+        )
 
     @override
     def table_names(
@@ -467,7 +500,7 @@ class LanceNamespaceDBConnection(DBConnection):
 
         table_id = namespace_path + [name]
 
-        if "CreateTable" in self._pushdown_operations:
+        if "CreateTable" in self._namespace_client_pushdown_operations:
             return self._create_table_server_side(
                 name=name,
                 data=data,
@@ -549,7 +582,7 @@ class LanceNamespaceDBConnection(DBConnection):
             storage_options=merged_storage_options,
             location=location,
             namespace_client=self._namespace_client,
-            pushdown_operations=self._pushdown_operations,
+            pushdown_operations=self._namespace_client_pushdown_operations,
         )
 
         return tbl
@@ -580,10 +613,13 @@ class LanceNamespaceDBConnection(DBConnection):
             fill_value=fill_value,
         )
 
+        merged = dict(self.storage_options or {})
+        if storage_options:
+            merged.update(storage_options)
         request = CreateTableRequest(
             id=table_id,
             mode=_normalize_create_table_mode(mode),
-            properties=self.storage_options if self.storage_options else None,
+            properties=merged or None,
         )
 
         try:
@@ -887,7 +923,7 @@ class LanceNamespaceDBConnection(DBConnection):
             location=table_uri,
             namespace_client=namespace_client,
             managed_versioning=managed_versioning,
-            pushdown_operations=self._pushdown_operations,
+            pushdown_operations=self._namespace_client_pushdown_operations,
         )
 
     @override
@@ -951,7 +987,9 @@ class AsyncLanceNamespaceDBConnection:
         self.read_consistency_interval = read_consistency_interval
         self.storage_options = storage_options or {}
         self.session = session
-        self._pushdown_operations = set(namespace_client_pushdown_operations or [])
+        self._namespace_client_pushdown_operations = set(
+            namespace_client_pushdown_operations or []
+        )
 
     async def table_names(
         self,
@@ -1006,7 +1044,7 @@ class AsyncLanceNamespaceDBConnection:
 
         table_id = namespace_path + [name]
 
-        if "CreateTable" in self._pushdown_operations:
+        if "CreateTable" in self._namespace_client_pushdown_operations:
             return await self._create_table_server_side(
                 name=name,
                 data=data,
@@ -1086,7 +1124,7 @@ class AsyncLanceNamespaceDBConnection:
                 storage_options=merged_storage_options,
                 location=location,
                 namespace_client=self._namespace_client,
-                pushdown_operations=self._pushdown_operations,
+                pushdown_operations=self._namespace_client_pushdown_operations,
             )
 
         lance_table = await asyncio.to_thread(_create_table)
@@ -1120,10 +1158,13 @@ class AsyncLanceNamespaceDBConnection:
                 fill_value=fill_value,
             )
 
+            merged = dict(self.storage_options or {})
+            if storage_options:
+                merged.update(storage_options)
             request = CreateTableRequest(
                 id=table_id,
                 mode=_normalize_create_table_mode(mode),
-                properties=self.storage_options if self.storage_options else None,
+                properties=merged or None,
             )
 
             self._namespace_client.create_table(request, arrow_ipc_bytes)
@@ -1190,7 +1231,7 @@ class AsyncLanceNamespaceDBConnection:
                 location=response.location,
                 namespace_client=self._namespace_client,
                 managed_versioning=managed_versioning,
-                pushdown_operations=self._pushdown_operations,
+                pushdown_operations=self._namespace_client_pushdown_operations,
             )
 
         lance_table = await asyncio.to_thread(_open_table)
@@ -1472,6 +1513,8 @@ def connect_namespace(
         storage_options=storage_options,
         session=session,
         namespace_client_pushdown_operations=namespace_client_pushdown_operations,
+        namespace_client_impl=namespace_client_impl,
+        namespace_client_properties=namespace_client_properties,
     )
 
 
