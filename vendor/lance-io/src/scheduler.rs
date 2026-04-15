@@ -565,16 +565,23 @@ impl ScanScheduler {
             ));
             IoQueueType::Lite(io_queue)
         } else {
-            let io_queue = Arc::new(IoQueue::new(
-                io_capacity as u32,
-                config.io_buffer_size_bytes,
-            ));
-            let io_queue_clone = io_queue.clone();
-            // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
-            // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
-            // to wait for it to finish but that doesn't seem helpful.
-            tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
-            IoQueueType::Standard(io_queue)
+            #[cfg(target_arch = "wasm32")]
+            {
+                panic!("The standard I/O scheduler is not supported on wasm32. Use with_lite_scheduler().");
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let io_queue = Arc::new(IoQueue::new(
+                    io_capacity as u32,
+                    config.io_buffer_size_bytes,
+                ));
+                let io_queue_clone = io_queue.clone();
+                // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
+                // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
+                // to wait for it to finish but that doesn't seem helpful.
+                tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
+                IoQueueType::Standard(io_queue)
+            }
         };
         Arc::new(Self {
             object_store,

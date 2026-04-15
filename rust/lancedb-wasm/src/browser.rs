@@ -98,7 +98,7 @@ impl BrowserTable {
         .map_err(Error::from)?;
         let scan_scheduler = ScanScheduler::new(
             object_store.clone(),
-            SchedulerConfig::max_bandwidth(&object_store),
+            SchedulerConfig::max_bandwidth(&object_store).with_lite_scheduler(),
         );
         let metadata_cache = match options.cache_bytes {
             Some(capacity) if capacity > 0 => LanceCache::with_capacity(capacity),

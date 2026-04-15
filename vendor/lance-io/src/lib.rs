@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+#![allow(dead_code, unused_imports, unused_variables)]
 use std::{
     ops::{Range, RangeFrom, RangeFull, RangeTo},
     sync::Arc,

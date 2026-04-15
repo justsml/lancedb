@@ -4,7 +4,9 @@
 //! Read-only HTTP search bindings for LanceDB tables.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[cfg(target_arch = "wasm32")]

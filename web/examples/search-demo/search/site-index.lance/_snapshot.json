@@ -1,6 +1,6 @@
 {
-  "version": 3,
-  "manifestPath": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551612.manifest",
+  "version": 4,
+  "manifestPath": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551611.manifest",
   "manifestSizeBytes": 1005,
   "manifestNamingScheme": "v2",
   "latestManifestPath": "_latest.manifest",
@@ -14,7 +14,7 @@
   "basePaths": [],
   "files": [
     {
-      "path": "1011100100001000110111101aef61453ca4096c33f71d074e.lance",
+      "path": "0000111001101110000100014a91ba49b5aa646a1bfcff80c1.lance",
       "kind": "data",
       "sizeBytes": 42563,
       "baseId": null
@@ -32,13 +32,13 @@
       "baseId": null
     },
     {
-      "path": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551612.manifest",
+      "path": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551611.manifest",
       "kind": "manifest",
       "sizeBytes": 1005,
       "baseId": null
     },
     {
-      "path": "2-41f03e21-79f7-4053-be83-00b4a7c2f2e7.txn",
+      "path": "3-5daf19e4-3d24-46c5-b910-7d95329452ac.txn",
       "kind": "transaction",
       "sizeBytes": null,
       "baseId": null

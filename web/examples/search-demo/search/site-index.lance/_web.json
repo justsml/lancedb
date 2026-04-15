@@ -1,6 +1,6 @@
 {
-  "version": 3,
-  "manifestPath": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551612.manifest",
+  "version": 4,
+  "manifestPath": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551611.manifest",
   "manifestSizeBytes": 1005,
   "manifestNamingScheme": "v2",
   "latestManifestPath": "_latest.manifest",

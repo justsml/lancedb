@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 #![cfg_attr(coverage, feature(coverage_attribute))]
+#![allow(dead_code, unused_imports, unused_variables)]
 
 use arrow_schema::{DataType, Field as ArrowField};
 use std::sync::LazyLock;
