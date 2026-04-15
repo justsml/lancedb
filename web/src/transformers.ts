@@ -1,69 +1,37 @@
-import type { Schema, Table as ArrowTable } from "apache-arrow";
-import {
-  openTable,
-  type OpenTableOptions,
-  type RemoteSearchTable,
-  type SearchRequest,
-} from "./index.js";
+// ---------------------------------------------------------------------------
+// Re-export everything from embedding.ts so that existing
+// `import { ... } from "@lancedb/lancedb-web/transformers"` continues to work.
+// ---------------------------------------------------------------------------
+export {
+  type EmbeddingModel,
+  type EmbedResult,
+  type EmbedManyResult,
+  type EmbedRequest,
+  type EmbedManyRequest,
+  type PoolingStrategy,
+  type QueryTransformContext,
+  type SearchTableOptions,
+  type TransformersSearchTableOptions,
+  type TextEmbeddingSearchRequest,
+  type TextEmbeddingSearchTable,
+  embed,
+  embedMany,
+  searchTable,
+  __registerModelFactory,
+} from "./embedding.js";
 
-export type PoolingStrategy = "mean" | "cls" | "last_token";
-
-export interface QueryTransformContext {
-  /** The Hugging Face model id being used to embed. */
-  model: string;
-}
+import type {
+  EmbeddingModel,
+  EmbedResult,
+  EmbedManyResult,
+  PoolingStrategy,
+  QueryTransformContext,
+  SearchTableOptions,
+} from "./embedding.js";
+import { __registerModelFactory } from "./embedding.js";
 
 // ---------------------------------------------------------------------------
-// EmbeddingModel — the first-class abstraction
-// ---------------------------------------------------------------------------
-
-/**
- * A model that can embed text into vectors.
- *
- * Pass an `EmbeddingModel` as the second argument to `searchTable`, or to the
- * standalone `embed`/`embedMany` functions.  Use `transformersEmbedder()` to
- * create one backed by `@huggingface/transformers`, or bring your own
- * implementation.
- */
-export interface EmbeddingModel {
-  /** Embed a single text value. */
-  embed(value: string, options?: { signal?: AbortSignal }): Promise<EmbedResult>;
-  /** Embed multiple text values. */
-  embedMany(values: string[], options?: { signal?: AbortSignal }): Promise<EmbedManyResult>;
-  /**
-   * Eagerly load the model weights and tokenizer so the first `embed()` call
-   * doesn't pay the full download + init cost.  No-op if already loaded or if
-   * the implementation doesn't support preloading.
-   */
-  preload?(): Promise<void>;
-  /**
-   * Release the loaded model and tokenizer from memory.  After calling
-   * `dispose()` the model can still be used — it will simply re-download on
-   * the next `embed()` call.
-   */
-  dispose?(): void;
-}
-
-/**
- * Result of a single embedding operation.  Mirrors the shape returned by
- * the Vercel AI SDK `embed()` function.
- */
-export interface EmbedResult {
-  /** The embedding vector for the input value. */
-  embedding: number[];
-}
-
-/**
- * Result of a batch embedding operation.  Mirrors the shape returned by
- * the Vercel AI SDK `embedMany()` function.
- */
-export interface EmbedManyResult {
-  /** One embedding vector per input value, in the same order. */
-  embeddings: number[][];
-}
-
-// ---------------------------------------------------------------------------
-// transformersEmbedder — factory for HuggingFace-backed EmbeddingModel
+// TransformersEmbedderOptions
 // ---------------------------------------------------------------------------
 
 export interface TransformersEmbedderOptions {
@@ -109,6 +77,10 @@ export interface TransformersEmbedderOptions {
   };
 }
 
+// ---------------------------------------------------------------------------
+// transformersEmbedder — factory for HuggingFace-backed EmbeddingModel
+// ---------------------------------------------------------------------------
+
 /**
  * Create an `EmbeddingModel` backed by `@huggingface/transformers`.
  *
@@ -142,216 +114,27 @@ export function transformersEmbedder(
 }
 
 // ---------------------------------------------------------------------------
-// Standalone embed / embedMany
+// Register the transformers-backed factory so embedding.ts can resolve
+// string model ids automatically.
 // ---------------------------------------------------------------------------
 
-export interface EmbedRequest {
-  /** The text value to embed. */
-  value: string;
-  /**
-   * An `EmbeddingModel`, or a Hugging Face model id string that will be
-   * auto-promoted to one via `transformersEmbedder()`.
-   */
-  model?: string | EmbeddingModel;
-  /** Abort signal for cancellation (e.g. typeahead debouncing). */
-  signal?: AbortSignal;
-}
-
-export interface EmbedManyRequest {
-  /** The text values to embed. */
-  values: string[];
-  /**
-   * An `EmbeddingModel`, or a Hugging Face model id string that will be
-   * auto-promoted to one via `transformersEmbedder()`.
-   */
-  model?: string | EmbeddingModel;
-  /** Abort signal for cancellation. */
-  signal?: AbortSignal;
-}
-
-/**
- * Embed a single text value.
- *
- * ```ts
- * import { embed } from "@lancedb/lancedb-web/transformers";
- *
- * const { embedding } = await embed({
- *   model: "BAAI/bge-small-en-v1.5",
- *   value: "best places to hike in colorado",
- * });
- * ```
- */
-export async function embed(request: EmbedRequest): Promise<EmbedResult> {
-  const model = resolveModel(request.model);
-  return model.embed(request.value, { signal: request.signal });
-}
-
-/**
- * Embed multiple text values.
- *
- * ```ts
- * import { embedMany } from "@lancedb/lancedb-web/transformers";
- *
- * const { embeddings } = await embedMany({
- *   model: "BAAI/bge-small-en-v1.5",
- *   values: ["hiking trails", "mountain biking"],
- * });
- * ```
- */
-export async function embedMany(
-  request: EmbedManyRequest,
-): Promise<EmbedManyResult> {
-  const model = resolveModel(request.model);
-  return model.embedMany(request.values, { signal: request.signal });
-}
-
-// ---------------------------------------------------------------------------
-// searchTable
-// ---------------------------------------------------------------------------
-
-export interface TransformersSearchTableOptions extends OpenTableOptions {
-  /**
-   * An `EmbeddingModel`, or a Hugging Face model id to auto-promote.
-   *
-   * Defaults to `Xenova/all-MiniLM-L6-v2`.
-   */
-  model?: string | EmbeddingModel;
-  /**
-   * Optional tokenizer override (only used when `model` is a string).
-   */
-  tokenizer?: string;
-  /**
-   * Pooling strategy (only used when `model` is a string).
-   */
-  pooling?: PoolingStrategy;
-  /**
-   * Normalize the final embedding (only used when `model` is a string).
-   *
-   * Defaults to `true`.
-   */
-  normalize?: boolean;
-  /**
-   * Optional hook to rewrite query text before embedding (only used when
-   * `model` is a string).
-   */
-  prepareQuery?: (query: string, context: QueryTransformContext) => string;
-  /**
-   * Options passed to `AutoModel.from_pretrained` (only used when `model` is
-   * a string).
-   */
-  modelOptions?: Record<string, unknown>;
-  /**
-   * Options passed to the tokenizer (only used when `model` is a string).
-   */
-  tokenizerOptions?: {
-    textPair?: string | string[];
-    padding?: boolean | "max_length";
-    addSpecialTokens?: boolean;
-    truncation?: boolean;
-    maxLength?: number;
-  };
-}
-
-export interface TextEmbeddingSearchRequest
-  extends Omit<SearchRequest, "text" | "vector"> {
-  /**
-   * Natural language query text to embed on the client.
-   */
-  text: string;
-  /**
-   * When true, logs the resolved embedding configuration to `console.debug`.
-   */
-  debug?: boolean;
-  /** Abort signal for cancellation (e.g. typeahead debouncing). */
-  signal?: AbortSignal;
-}
-
-export interface TextEmbeddingSearchTable {
-  /** The `EmbeddingModel` powering this table's search. */
-  readonly model: EmbeddingModel;
-  /** Arbitrary user-defined metadata from the published sidecar files. */
-  readonly metadata: Record<string, string>;
-  schema(): Promise<Schema>;
-  search(request: TextEmbeddingSearchRequest): Promise<ArrowTable>;
-  refresh(): Promise<boolean>;
-  close(): void;
-}
-
-/**
- * Open a published Lance table and wrap it with client-side query embedding
- * generation.
- *
- * The second argument is an `EmbeddingModel`, a Hugging Face model id string
- * (auto-promoted via `transformersEmbedder()`), or an options object.
- *
- * ```ts
- * // String shorthand — auto-promoted to EmbeddingModel
- * const t = await searchTable(url, "BAAI/bge-small-en-v1.5");
- *
- * // Bring your own EmbeddingModel
- * const t = await searchTable(url, myEmbeddingModel);
- *
- * // Options object
- * const t = await searchTable(url, { model: "BAAI/bge-small-en-v1.5", normalize: false });
- * ```
- */
-export async function searchTable(
-  tableUrl: string,
-  model?: string | EmbeddingModel,
-  options?: OpenTableOptions,
-): Promise<TextEmbeddingSearchTable>;
-export async function searchTable(
-  tableUrl: string,
-  options?: TransformersSearchTableOptions,
-): Promise<TextEmbeddingSearchTable>;
-export async function searchTable(
-  tableUrl: string,
-  modelOrOptions:
-    | string
-    | EmbeddingModel
-    | TransformersSearchTableOptions = {},
-  options?: OpenTableOptions,
-): Promise<TextEmbeddingSearchTable> {
-  let embeddingModel: EmbeddingModel;
-  let openOptions: OpenTableOptions;
-
-  if (typeof modelOrOptions === "string") {
-    embeddingModel = transformersEmbedder(modelOrOptions);
-    openOptions = options ?? {};
-  } else if (isEmbeddingModel(modelOrOptions)) {
-    embeddingModel = modelOrOptions;
-    openOptions = options ?? {};
-  } else {
-    const {
-      model,
-      tokenizer,
-      pooling,
-      normalize,
-      prepareQuery,
-      modelOptions,
-      tokenizerOptions,
-      ...rest
-    } = modelOrOptions;
-    openOptions = rest;
-
-    if (isEmbeddingModel(model)) {
-      embeddingModel = model;
-    } else {
-      embeddingModel = buildEmbeddingModel({
-        model,
-        tokenizer,
-        pooling,
-        normalize,
-        prepareQuery,
-        modelOptions,
-        tokenizerOptions,
-      });
+__registerModelFactory(
+  (modelId?: string, searchOptions?: SearchTableOptions): EmbeddingModel => {
+    const opts: TransformersEmbedderOptions = {};
+    if (modelId !== undefined) {
+      opts.model = modelId;
     }
-  }
-
-  const table = await openTable(tableUrl, openOptions);
-  return new TextEmbeddingSearchTableImpl(table, embeddingModel);
-}
+    if (searchOptions !== undefined) {
+      if (searchOptions.tokenizer !== undefined) opts.tokenizer = searchOptions.tokenizer;
+      if (searchOptions.pooling !== undefined) opts.pooling = searchOptions.pooling;
+      if (searchOptions.normalize !== undefined) opts.normalize = searchOptions.normalize;
+      if (searchOptions.prepareQuery !== undefined) opts.prepareQuery = searchOptions.prepareQuery;
+      if (searchOptions.modelOptions !== undefined) opts.modelOptions = searchOptions.modelOptions;
+      if (searchOptions.tokenizerOptions !== undefined) opts.tokenizerOptions = searchOptions.tokenizerOptions;
+    }
+    return buildEmbeddingModel(opts);
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -477,24 +260,8 @@ export function __setTransformersModuleLoaderForTests(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: resolve model arg, build EmbeddingModel
+// buildEmbeddingModel
 // ---------------------------------------------------------------------------
-
-function isEmbeddingModel(value: unknown): value is EmbeddingModel {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as EmbeddingModel).embed === "function" &&
-    typeof (value as EmbeddingModel).embedMany === "function"
-  );
-}
-
-function resolveModel(model: string | EmbeddingModel | undefined): EmbeddingModel {
-  if (model === undefined || typeof model === "string") {
-    return buildEmbeddingModel({ model });
-  }
-  return model;
-}
 
 function buildEmbeddingModel(
   options: TransformersEmbedderOptions,
@@ -593,53 +360,6 @@ function buildEmbeddingModel(
       resourcesCache.delete(cacheKey);
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// TextEmbeddingSearchTableImpl
-// ---------------------------------------------------------------------------
-
-class TextEmbeddingSearchTableImpl implements TextEmbeddingSearchTable {
-  readonly #table: RemoteSearchTable;
-  readonly model: EmbeddingModel;
-
-  get metadata(): Record<string, string> {
-    return this.#table.metadata;
-  }
-
-  constructor(table: RemoteSearchTable, model: EmbeddingModel) {
-    this.#table = table;
-    this.model = model;
-  }
-
-  schema(): Promise<Schema> {
-    return this.#table.schema();
-  }
-
-  async search(request: TextEmbeddingSearchRequest): Promise<ArrowTable> {
-    const { text, debug, signal, ...vectorSearchRequest } = request;
-    const { embedding } = await this.model.embed(text, { signal });
-
-    if (debug && typeof console.debug === "function") {
-      console.debug("[@lancedb/lancedb-web/transformers]", {
-        query: text,
-        dimensions: embedding.length,
-      });
-    }
-
-    return await this.#table.search({
-      ...vectorSearchRequest,
-      vector: embedding,
-    });
-  }
-
-  refresh(): Promise<boolean> {
-    return this.#table.refresh();
-  }
-
-  close(): void {
-    this.#table.close();
-  }
 }
 
 // ---------------------------------------------------------------------------

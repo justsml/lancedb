@@ -14,6 +14,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./embedding": {
+      "types": "./dist/embedding.d.ts",
+      "default": "./dist/embedding.js"
+    },
     "./transformers": {
       "types": "./dist/transformers.d.ts",
       "default": "./dist/transformers.js"

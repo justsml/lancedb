@@ -138,46 +138,41 @@ interface HandleBackend {
 
 type WorkerFactory = () => Promise<WorkerLike> | WorkerLike;
 
-const DEFAULT_WORKER_INIT_TIMEOUT_MS = 10_000;
+// 30s allows for cold-start WASM download + compile + table open on slow connections.
+const DEFAULT_WORKER_INIT_TIMEOUT_MS = 30_000;
 
 let wasmModuleLoader: () => Promise<WasmModule> = async () =>
   (await import("./generated/lancedb_wasm.js")) as WasmModule;
 let workerFactoryOverride: WorkerFactory | null = null;
-let fetchOverrideQueue = Promise.resolve();
+// WASM (via web-sys) calls globalThis.fetch internally. When callers supply a
+// custom fetch (e.g. for auth headers or caching), we must temporarily install
+// it as the global. A lock serializes these swaps so concurrent opens/searches
+// don't clobber each other.  This is a workaround until wasm-bindgen supports
+// passing fetch callbacks directly.
+let _fetchLock: Promise<void> = Promise.resolve();
 
-function usesCustomFetch(fetchFn: typeof globalThis.fetch | undefined): boolean {
-  return fetchFn !== undefined && fetchFn !== globalThis.fetch;
-}
-
-async function withFetchOverride<T>(
+async function withScopedFetch<T>(
   fetchFn: typeof globalThis.fetch | undefined,
-  operation: () => Promise<T>,
+  fn: () => Promise<T>,
 ): Promise<T> {
-  if (!usesCustomFetch(fetchFn)) {
-    return await operation();
+  if (fetchFn === undefined || fetchFn === globalThis.fetch) {
+    return fn();
   }
 
-  const root = globalThis as typeof globalThis & {
-    fetch?: typeof globalThis.fetch;
-  };
-  const run = fetchOverrideQueue.then(async () => {
-    const previousFetch = root.fetch;
-    root.fetch = fetchFn!;
-    try {
-      return await operation();
-    } finally {
-      if (previousFetch === undefined) {
-        Reflect.deleteProperty(root, "fetch");
-      } else {
-        root.fetch = previousFetch;
-      }
-    }
-  });
-  fetchOverrideQueue = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return await run;
+  // Serialize access so overlapping calls don't clobber each other.
+  let release!: () => void;
+  const prev = _fetchLock;
+  _fetchLock = new Promise<void>((r) => { release = r; });
+  await prev;
+
+  const saved = globalThis.fetch;
+  globalThis.fetch = fetchFn;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = saved;
+    release();
+  }
 }
 
 class DirectHandleBackend implements HandleBackend {
@@ -186,7 +181,7 @@ class DirectHandleBackend implements HandleBackend {
     optionsJson?: string,
     fetchOverride?: typeof globalThis.fetch,
   ): Promise<DirectHandleBackend> {
-    return await withFetchOverride(fetchOverride, async () => {
+    return await withScopedFetch(fetchOverride, async () => {
       const wasmModule = await wasmModuleLoader();
       return new DirectHandleBackend(
         await wasmModule.open_table(tableUrl, optionsJson),
@@ -207,18 +202,18 @@ class DirectHandleBackend implements HandleBackend {
   }
 
   schema(): Promise<Uint8Array> {
-    return withFetchOverride(this.#fetchOverride, async () => await this.#handle.schema());
+    return withScopedFetch(this.#fetchOverride, async () => await this.#handle.schema());
   }
 
   search(requestJson: string): Promise<Uint8Array> {
-    return withFetchOverride(
+    return withScopedFetch(
       this.#fetchOverride,
       async () => await this.#handle.search(requestJson),
     );
   }
 
   refresh(): Promise<boolean> {
-    return withFetchOverride(this.#fetchOverride, async () => await this.#handle.refresh());
+    return withScopedFetch(this.#fetchOverride, async () => await this.#handle.refresh());
   }
 
   close(): void {
@@ -580,7 +575,7 @@ async function openHandleBackend(
   optionsJson: string | undefined,
   options: OpenTableOptions,
 ): Promise<HandleBackend> {
-  if (usesCustomFetch(options.fetch)) {
+  if (options.fetch !== undefined && options.fetch !== globalThis.fetch) {
     return await DirectHandleBackend.open(tableUrl, optionsJson, options.fetch);
   }
 
