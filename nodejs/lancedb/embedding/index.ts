@@ -6,15 +6,23 @@ import { sanitizeType } from "../sanitize";
 import { EmbeddingFunction } from "./embedding_function";
 import { EmbeddingFunctionConfig, getRegistry } from "./registry";
 
-export {
+export { EmbeddingFunction, TextEmbeddingFunction } from "./embedding_function";
+export type {
   FieldOptions,
-  EmbeddingFunction,
-  TextEmbeddingFunction,
   FunctionOptions,
   EmbeddingFunctionConstructor,
 } from "./embedding_function";
 
-export * from "./registry";
+export {
+  EmbeddingFunctionRegistry,
+  register,
+  getRegistry,
+} from "./registry";
+export type {
+  CreateReturnType,
+  EmbeddingFunctionCreate,
+  EmbeddingFunctionConfig,
+} from "./registry";
 
 /**
  * Create a schema with embedding functions.

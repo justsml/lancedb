@@ -1,0 +1,56 @@
+{
+  "version": 3,
+  "manifestPath": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551612.manifest",
+  "manifestSizeBytes": 1005,
+  "manifestNamingScheme": "v2",
+  "latestManifestPath": "_latest.manifest",
+  "latestVersionPath": "_latest.version",
+  "webMetadataPath": "_web.json",
+  "snapshotPath": "_snapshot.json",
+  "defaultVectorColumn": "vector",
+  "vectorColumns": [],
+  "ftsColumns": [],
+  "isComplete": true,
+  "basePaths": [],
+  "files": [
+    {
+      "path": "1011100100001000110111101aef61453ca4096c33f71d074e.lance",
+      "kind": "data",
+      "sizeBytes": 42563,
+      "baseId": null
+    },
+    {
+      "path": "_latest.manifest",
+      "kind": "latestManifest",
+      "sizeBytes": 1005,
+      "baseId": null
+    },
+    {
+      "path": "_latest.version",
+      "kind": "latestVersion",
+      "sizeBytes": 1,
+      "baseId": null
+    },
+    {
+      "path": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551612.manifest",
+      "kind": "manifest",
+      "sizeBytes": 1005,
+      "baseId": null
+    },
+    {
+      "path": "2-41f03e21-79f7-4053-be83-00b4a7c2f2e7.txn",
+      "kind": "transaction",
+      "sizeBytes": null,
+      "baseId": null
+    },
+    {
+      "path": "_web.json",
+      "kind": "webMetadata",
+      "sizeBytes": 450,
+      "baseId": null
+    }
+  ],
+  "metadata": {
+    "embeddingModel": "BAAI/bge-small-en-v1.5"
+  }
+}

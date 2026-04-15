@@ -66,6 +66,8 @@ export interface SearchRequest {
 
 /** Read-only handle for a published HTTP-hosted table. */
 export interface RemoteSearchTable {
+  /** Arbitrary user-defined metadata from the published sidecar files. */
+  readonly metadata: Record<string, string>;
   schema(): Promise<Schema>;
   search(request: SearchRequest): Promise<ArrowTable>;
   refresh(): Promise<boolean>;
@@ -94,6 +96,8 @@ interface PublishedTableMetadata {
   defaultVectorColumn?: string;
   vectorColumns: string[];
   ftsColumns: string[];
+  /** Arbitrary user-defined key-value metadata (e.g. embedding model, LLM URI). */
+  metadata?: Record<string, string>;
 }
 
 interface PublishedSnapshot extends PublishedTableMetadata {
@@ -425,6 +429,7 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
   #headersSignature: string;
   #handle: HandleBackend | null;
   #published: ResolvedPublishedState;
+  metadata: Record<string, string>;
 
   private constructor(
     tableUrl: string,
@@ -438,6 +443,7 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
     this.#headersSignature = headersSignature;
     this.#handle = handle;
     this.#published = published;
+    this.metadata = extractMetadata(published);
   }
 
   static async open(
@@ -496,6 +502,7 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
           await resolveHeaders(this.#options.headers),
           this.#options,
         );
+        this.metadata = extractMetadata(this.#published);
       }
       return changed;
     }
@@ -678,6 +685,10 @@ async function preflightOpen(
       `Remote table open requires a Content-Range header for ${manifestUrl}.`,
     );
   }
+}
+
+function extractMetadata(published: ResolvedPublishedState): Record<string, string> {
+  return (published.tableMetadata ?? published.snapshot)?.metadata ?? {};
 }
 
 async function resolvePublishedState(

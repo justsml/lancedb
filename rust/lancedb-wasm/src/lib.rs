@@ -253,6 +253,9 @@ struct PublishedTableMetadata {
     vector_columns: Vec<String>,
     #[serde(default)]
     fts_columns: Vec<String>,
+    /// Arbitrary user-defined key-value metadata (e.g. embedding model, LLM URI).
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -272,6 +275,9 @@ struct PublishedSnapshot {
     #[serde(default)]
     fts_columns: Vec<String>,
     is_complete: bool,
+    /// Arbitrary user-defined key-value metadata (e.g. embedding model, LLM URI).
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]

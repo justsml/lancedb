@@ -44,7 +44,7 @@ import {
 } from "./query";
 import { sanitizeType } from "./sanitize";
 import { IntoSql, toSQL } from "./util";
-export { IndexConfig } from "./native";
+export type { IndexConfig } from "./native";
 
 /**
  * Options for adding data to a table.

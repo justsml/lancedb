@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Thinkify - Physical Thinking Tokens</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <nav>
+    <a href="/" class="logo">Thinkify</a>
+    <div class="nav-links">
+      <a href="/products.html">Products</a>
+      <a href="/about.html">About</a>
+      <a href="/events.html">Events</a>
+    </div>
+  </nav>
+
+  <main>
+    <section class="hero">
+      <h1>Physical Thinking Tokens</h1>
+      <p class="tagline">For when your brain just <em>can't even</em>.</p>
+      <p class="sub">Serious ThinkMaxxing starts here.</p>
+    </section>
+
+    <section class="search-section">
+      <h2>Search Our Universe of Thought</h2>
+      <div class="search-container">
+        <input
+          type="text"
+          id="search-input"
+          placeholder="e.g. enterprise thinking solutions..."
+          autocomplete="off"
+        />
+        <button id="search-btn">Think</button>
+      </div>
+      <div id="status" class="status"></div>
+      <div id="results" class="results"></div>
+    </section>
+
+    <section class="cta">
+      <h2>Stop Not Thinking. Start ThinkMaxxing.</h2>
+      <p>Browse our <a href="/products.html">product line</a> or learn about our <a href="/events.html">event sponsorships</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p>&copy; 2026 Thinkify Inc. All thoughts reserved.</p>
+    <p class="powered">Search powered by <code>@lancedb/lancedb-web</code></p>
+  </footer>
+
+  <script type="module" src="./search.ts"></script>
+</body>
+</html>

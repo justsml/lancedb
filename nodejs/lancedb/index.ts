@@ -12,14 +12,15 @@ import {
   Connection as LanceDbConnection,
   JsHeaderProvider as NativeJsHeaderProvider,
   Session,
+  TagContents,
+  Tags,
 } from "./native.js";
 
 import { HeaderProvider } from "./header";
 
-// Re-export native header provider for use with connectWithHeaderProvider
-export { JsHeaderProvider as NativeJsHeaderProvider } from "./native.js";
+export { Tags, TagContents, Session, NativeJsHeaderProvider };
 
-export {
+export type {
   AddColumnsSql,
   ConnectionOptions,
   IndexStatistics,
@@ -34,8 +35,6 @@ export {
   TableStatistics,
   FragmentStatistics,
   FragmentSummaryStats,
-  Tags,
-  TagContents,
   MergeResult,
   AddResult,
   AddColumnsResult,
@@ -53,29 +52,23 @@ export {
 export {
   makeArrowTable,
   MakeArrowTableOptions,
-  Data,
   VectorColumnOptions,
 } from "./arrow";
+export type { Data } from "./arrow";
 
-export {
-  Connection,
+export { Connection } from "./connection";
+export type {
   CreateTableOptions,
   TableNamesOptions,
   OpenTableOptions,
 } from "./connection";
 
-export { Session } from "./native.js";
-
 export {
-  ExecutableQuery,
   Query,
   QueryBase,
   VectorQuery,
   TakeQuery,
-  QueryExecutionOptions,
-  FullTextSearchOptions,
   RecordBatchIterator,
-  FullTextQuery,
   MatchQuery,
   PhraseQuery,
   BoostQuery,
@@ -85,9 +78,15 @@ export {
   Operator,
   Occur,
 } from "./query";
+export type {
+  ExecutableQuery,
+  QueryExecutionOptions,
+  FullTextSearchOptions,
+  FullTextQuery,
+} from "./query";
 
-export {
-  Index,
+export { Index } from "./indices";
+export type {
   IndexOptions,
   IvfPqOptions,
   IvfRqOptions,
@@ -97,8 +96,8 @@ export {
   FtsOptions,
 } from "./indices";
 
-export {
-  Table,
+export { Table } from "./table";
+export type {
   AddDataOptions,
   UpdateOptions,
   OptimizeOptions,
@@ -110,15 +109,16 @@ export {
   HeaderProvider,
   StaticHeaderProvider,
   OAuthHeaderProvider,
-  TokenResponse,
 } from "./header";
+export type { TokenResponse } from "./header";
 
-export { MergeInsertBuilder, WriteExecutionOptions } from "./merge";
+export { MergeInsertBuilder } from "./merge";
+export type { WriteExecutionOptions } from "./merge";
 
 export * as embedding from "./embedding";
 export { permutationBuilder, PermutationBuilder } from "./permutation";
 export * as rerankers from "./rerankers";
-export {
+export type {
   SchemaLike,
   TableLike,
   FieldLike,
@@ -127,7 +127,8 @@ export {
   IntoVector,
   MultiVector,
 } from "./arrow";
-export { IntoSql, packBits } from "./util";
+export type { IntoSql } from "./util";
+export { packBits } from "./util";
 
 /**
  * Connect to a LanceDB instance at the given URI.

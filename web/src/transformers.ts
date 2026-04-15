@@ -269,6 +269,8 @@ export interface TextEmbeddingSearchRequest
 export interface TextEmbeddingSearchTable {
   /** The `EmbeddingModel` powering this table's search. */
   readonly model: EmbeddingModel;
+  /** Arbitrary user-defined metadata from the published sidecar files. */
+  readonly metadata: Record<string, string>;
   schema(): Promise<Schema>;
   search(request: TextEmbeddingSearchRequest): Promise<ArrowTable>;
   refresh(): Promise<boolean>;
@@ -600,6 +602,10 @@ function buildEmbeddingModel(
 class TextEmbeddingSearchTableImpl implements TextEmbeddingSearchTable {
   readonly #table: RemoteSearchTable;
   readonly model: EmbeddingModel;
+
+  get metadata(): Record<string, string> {
+    return this.#table.metadata;
+  }
 
   constructor(table: RemoteSearchTable, model: EmbeddingModel) {
     this.#table = table;

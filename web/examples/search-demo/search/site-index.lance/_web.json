@@ -1,0 +1,16 @@
+{
+  "version": 3,
+  "manifestPath": "Users/dan/code/oss/lancedb/web/examples/search-demo/search/site-index.lance/_versions/18446744073709551612.manifest",
+  "manifestSizeBytes": 1005,
+  "manifestNamingScheme": "v2",
+  "latestManifestPath": "_latest.manifest",
+  "latestVersionPath": "_latest.version",
+  "webMetadataPath": "_web.json",
+  "snapshotPath": "_snapshot.json",
+  "defaultVectorColumn": "vector",
+  "vectorColumns": [],
+  "ftsColumns": [],
+  "metadata": {
+    "embeddingModel": "BAAI/bge-small-en-v1.5"
+  }
+}

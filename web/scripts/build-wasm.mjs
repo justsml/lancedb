@@ -50,9 +50,39 @@ function ensureWasmBindgen() {
   );
 }
 
+function findWasmClang() {
+  // Apple's system clang doesn't support wasm targets.
+  // Look for Homebrew LLVM clang which does.
+  if (process.env.CC_wasm32_unknown_unknown) {
+    return process.env.CC_wasm32_unknown_unknown;
+  }
+  const prefixes = ["/opt/homebrew/opt/llvm/bin", "/usr/local/opt/llvm/bin"];
+  for (const prefix of prefixes) {
+    const candidate = resolve(prefix, "clang");
+    try {
+      const result = spawnSync(candidate, ["--version"], { stdio: "ignore" });
+      if (result.status === 0) return candidate;
+    } catch {
+      // not found, try next
+    }
+  }
+  return undefined;
+}
+
 function buildRustWasm() {
   const existingRustflags = process.env.RUSTFLAGS?.trim();
   const getrandomFlag = '--cfg getrandom_backend="wasm_js"';
+  const wasmClang = findWasmClang();
+  const env = {
+    ...process.env,
+    RUSTFLAGS: existingRustflags
+      ? `${existingRustflags} ${getrandomFlag}`
+      : getrandomFlag,
+  };
+  if (wasmClang) {
+    env.CC_wasm32_unknown_unknown = wasmClang;
+    env.AR_wasm32_unknown_unknown = resolve(dirname(wasmClang), "llvm-ar");
+  }
   run(
     "cargo",
     [
@@ -64,12 +94,7 @@ function buildRustWasm() {
       "--release",
     ],
     repoRoot,
-    {
-      ...process.env,
-      RUSTFLAGS: existingRustflags
-        ? `${existingRustflags} ${getrandomFlag}`
-        : getrandomFlag,
-    },
+    env,
   );
 }
 

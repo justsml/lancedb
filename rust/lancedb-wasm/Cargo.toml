@@ -43,6 +43,7 @@ js-sys = "0.3.92"
 object_store = { version = "0.12.0", default-features = false }
 wasm-bindgen = "0.2.115"
 wasm-bindgen-futures = "0.4.55"
+uuid = { version = "1", features = ["js"] }
 web-sys = { version = "0.3.92", features = ["Headers", "Request", "RequestInit", "Response"] }
 
 [dev-dependencies]

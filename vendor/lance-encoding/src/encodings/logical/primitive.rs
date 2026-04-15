@@ -3970,7 +3970,7 @@ impl PrimitiveStructuralEncoder {
 
             let chunk_bytes = data_buffer.len() - start_pos;
             let max_chunk_size = if support_large_chunk {
-                4 * 1024 * 1024 * 1024 // 4GB limit with u32 metadata
+                (4u64 * 1024 * 1024 * 1024).min(usize::MAX as u64) as usize // 4GB limit with u32 metadata
             } else {
                 32 * 1024 // 32KiB limit with u16 metadata
             };
