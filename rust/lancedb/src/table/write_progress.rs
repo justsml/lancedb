@@ -145,6 +145,7 @@ impl WriteProgressTracker {
     /// Record wire bytes from the insert layer (e.g. IPC-encoded bytes for
     /// remote writes). When wire bytes are recorded, they take precedence over
     /// the in-memory Arrow bytes tracked by [`record_batch`].
+    #[cfg(feature = "remote")]
     pub fn record_bytes(&self, bytes: usize) {
         self.wire_bytes.fetch_add(bytes, Ordering::Relaxed);
     }

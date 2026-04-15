@@ -33,18 +33,15 @@ export type HeaderProvider =
 
 export type TextQuery = string | { query: string; columns?: string[] };
 
-export type DistanceType = "l2" | "cosine" | "dot" | "hamming";
+export type DistanceType = "l2" | "cosine" | "dot";
 
 export type Selection = string[] | Record<string, string>;
 
 /**
  * Browser-side search request.
  *
- * Notes:
- * - `text` queries are limited to published FTS columns when metadata is available.
- * - Browser-side vector execution currently supports `l2`, `cosine`, and `dot`.
- *   `hamming` is accepted at the type level for parity, but the browser execution
- *   path does not implement it yet.
+ * Published-sidecar defaults are resolved in the WASM runtime. The JS client
+ * forwards requests mostly as-is and only normalizes typed arrays for JSON.
  */
 export interface SearchRequest {
   vector?: Float32Array | number[];
@@ -55,18 +52,20 @@ export interface SearchRequest {
   limit?: number;
   offset?: number;
   /**
-   * The vector column to search against.  When omitted, defaults to the
-   * `defaultVectorColumn` from the table's published metadata (`_web.json`).
+   * The vector column to search against. When omitted, the WASM runtime may
+   * fall back to the published `defaultVectorColumn` if the table advertises one.
    */
   vectorColumn?: string;
   prefilter?: boolean;
   withRowId?: boolean;
-  fastSearch?: boolean;
 }
 
 /** Read-only handle for a published HTTP-hosted table. */
 export interface RemoteSearchTable {
-  /** Arbitrary user-defined metadata from the published sidecar files. */
+  /**
+   * @deprecated Published user metadata is not yet guaranteed to round-trip for
+   * browser-published tables.
+   */
   readonly metadata: Record<string, string>;
   schema(): Promise<Schema>;
   search(request: SearchRequest): Promise<ArrowTable>;
@@ -475,9 +474,8 @@ class RemoteSearchTableImpl implements RemoteSearchTable {
 
   async search(request: SearchRequest): Promise<ArrowTable> {
     await this.#ensureHandle();
-    const normalizedRequest = normalizeSearchRequest(request, this.#published);
     const bytes = await this.#handle!.search(
-      JSON.stringify(normalizedRequest),
+      JSON.stringify(serializeSearchRequest(request)),
     );
     return tableFromIPC(bytes);
   }
@@ -804,24 +802,9 @@ function resolvePublishedUrl(tableUrl: string, pathOrUrl: string): string {
   }
 }
 
-function normalizeSearchRequest(
-  request: SearchRequest,
-  published: ResolvedPublishedState,
-): Record<string, unknown> {
-  const metadata = published.tableMetadata ?? published.snapshot;
-  if (request.text !== undefined && metadata !== null && metadata.ftsColumns.length === 0) {
-    throw new Error(
-      "This table does not advertise any full-text search indexed columns in its published metadata.",
-    );
-  }
-
-  const vectorColumn =
-    request.vectorColumn ??
-    (request.vector !== undefined ? metadata?.defaultVectorColumn : undefined);
-
+function serializeSearchRequest(request: SearchRequest): Record<string, unknown> {
   return {
     ...request,
-    vectorColumn,
     vector:
       request.vector instanceof Float32Array
         ? Array.from(request.vector)

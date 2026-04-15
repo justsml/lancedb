@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -69,6 +69,8 @@ struct WebTableMetadata {
     default_vector_column: Option<String>,
     vector_columns: Vec<String>,
     fts_columns: Vec<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +87,8 @@ struct PublishedSnapshot {
     default_vector_column: Option<String>,
     vector_columns: Vec<String>,
     fts_columns: Vec<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
     is_complete: bool,
     base_paths: Vec<PublishedBasePath>,
     files: Vec<PublishedFile>,
@@ -122,20 +126,29 @@ impl CommitHandler for WebPublishCommitHandler {
         base_path: &Path,
         object_store: &lance_io::object_store::ObjectStore,
     ) -> lance_core::Result<ManifestLocation> {
-        let latest_copy = resolve_latest_copy_location(base_path, object_store).await?;
+        let latest_copy = resolve_latest_copy_location(base_path, object_store).await;
         let inner_latest = self
             .inner
             .resolve_latest_location(base_path, object_store)
             .await;
 
         match (latest_copy, inner_latest) {
-            (Some(copy), Ok(inner)) => Ok(if inner.version > copy.version {
+            (Ok(Some(copy)), Ok(inner)) => Ok(if inner.version > copy.version {
                 inner
             } else {
                 copy
             }),
-            (Some(copy), Err(_)) => Ok(copy),
-            (None, result) => result,
+            (Ok(Some(copy)), Err(_)) => Ok(copy),
+            (Ok(None), result) => result,
+            (Err(source), Ok(inner)) => {
+                warn!(
+                    "Failed to read published latest manifest copy at {}: {}. Falling back to canonical manifest resolution.",
+                    base_path.child(LATEST_MANIFEST_PATH),
+                    source
+                );
+                Ok(inner)
+            }
+            (Err(source), Err(_)) => Err(source),
         }
     }
 
@@ -471,6 +484,34 @@ fn build_snapshot_plan(manifest: &Manifest, indices: Option<&[IndexMetadata]>) -
     }
 }
 
+fn ensure_publishable_snapshot(snapshot_plan: &SnapshotPlan) -> Result<()> {
+    if let Some(file) = snapshot_plan
+        .files
+        .iter()
+        .find(|file| file.base_id.is_some())
+    {
+        return Err(Error::NotSupported {
+            message: format!(
+                "web publish sidecars do not support external base-path references yet; file '{}' ({}) uses base_id {}",
+                file.path,
+                file.kind,
+                file.base_id.expect("checked above")
+            ),
+        });
+    }
+
+    if let Some(base_path) = snapshot_plan.base_paths.first() {
+        return Err(Error::NotSupported {
+            message: format!(
+                "web publish sidecars do not support external base-path references yet; base path {} points to {}",
+                base_path.id, base_path.path
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 fn push_snapshot_file(files: &mut Vec<PublishedFile>, file: PublishedFile) {
     let already_present = files.iter().any(|candidate| {
         candidate.path == file.path
@@ -490,12 +531,15 @@ async fn publish_sidecars(
     capabilities: &WebSearchCapabilities,
     snapshot_plan: &SnapshotPlan,
 ) -> Result<()> {
+    ensure_publishable_snapshot(snapshot_plan)?;
+
     let manifest_bytes = object_store
         .inner
         .get(&manifest_location.path)
         .await?
         .bytes()
         .await?;
+    let published_metadata = manifest.config.clone();
 
     let latest_version_bytes = manifest.version.to_string().into_bytes();
     let metadata = WebTableMetadata {
@@ -511,6 +555,7 @@ async fn publish_sidecars(
         default_vector_column: capabilities.default_vector_column.clone(),
         vector_columns: capabilities.vector_columns.clone(),
         fts_columns: capabilities.fts_columns.clone(),
+        metadata: published_metadata.clone(),
     };
     let metadata_json = serde_json::to_vec_pretty(&metadata).map_err(|source| Error::Runtime {
         message: format!("failed to serialize web table metadata: {source}"),
@@ -572,6 +617,7 @@ async fn publish_sidecars(
         default_vector_column: capabilities.default_vector_column.clone(),
         vector_columns: capabilities.vector_columns.clone(),
         fts_columns: capabilities.fts_columns.clone(),
+        metadata: published_metadata,
         is_complete: snapshot_plan.is_complete,
         base_paths: snapshot_plan.base_paths.clone(),
         files: snapshot_files,
@@ -638,6 +684,7 @@ mod tests {
     };
     use arrow_data::ArrayDataBuilder;
     use arrow_schema::{DataType, Field, Schema};
+    use lance_table::format::BasePath;
     use tempfile::tempdir;
 
     use crate::connect;
@@ -647,7 +694,7 @@ mod tests {
     use super::{
         DEFAULT_VECTOR_COLUMN_KEY, FTS_COLUMNS_KEY, LATEST_MANIFEST_PATH, LATEST_VERSION_PATH,
         MANIFEST_NAMING_SCHEME_KEY, PublishedSnapshot, SNAPSHOT_PATH, VECTOR_COLUMNS_KEY,
-        WEB_METADATA_PATH, WebTableMetadata,
+        WEB_METADATA_PATH, WebTableMetadata, build_snapshot_plan, ensure_publishable_snapshot,
     };
 
     fn make_batch(start: i32, len: i32) -> RecordBatch {
@@ -785,9 +832,11 @@ mod tests {
         assert_eq!(metadata.default_vector_column.as_deref(), Some("vector"));
         assert_eq!(metadata.vector_columns, vec!["vector".to_string()]);
         assert_eq!(metadata.fts_columns, vec!["text".to_string()]);
+        assert_eq!(metadata.metadata, manifest.config);
         assert_eq!(snapshot.default_vector_column.as_deref(), Some("vector"));
         assert_eq!(snapshot.vector_columns, vec!["vector".to_string()]);
         assert_eq!(snapshot.fts_columns, vec!["text".to_string()]);
+        assert_eq!(snapshot.metadata, manifest.config);
         assert!(snapshot.is_complete);
         assert!(
             snapshot
@@ -862,6 +911,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn falls_back_to_canonical_manifest_when_latest_copy_is_corrupt() {
+        let dir = tempdir().unwrap();
+        let db = connect(dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        db.create_table("published", make_batch(0, 4))
+            .execute()
+            .await
+            .unwrap();
+
+        let root = table_root(dir.path());
+        fs::write(root.join(LATEST_MANIFEST_PATH), b"not a manifest").unwrap();
+
+        let reopened = NativeTable::open(root.to_str().unwrap()).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 4);
+    }
+
+    #[tokio::test]
     async fn ignores_stale_latest_manifest_copy_when_newer_manifest_exists() {
         let dir = tempdir().unwrap();
         let db = connect(dir.path().to_str().unwrap())
@@ -884,5 +953,89 @@ mod tests {
 
         let reopened = NativeTable::open(root.to_str().unwrap()).await.unwrap();
         assert_eq!(reopened.count_rows(None).await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn publishes_user_metadata_in_sidecars() {
+        let dir = tempdir().unwrap();
+        let db = connect(dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        let table = db
+            .create_table("published", make_batch(0, 4))
+            .execute()
+            .await
+            .unwrap();
+
+        table
+            .as_native()
+            .unwrap()
+            .update_config(vec![
+                (
+                    "embedding_model".to_string(),
+                    "text-embedding-3-large".to_string(),
+                ),
+                ("llm_uri".to_string(), "openai://responses".to_string()),
+            ])
+            .await
+            .unwrap();
+
+        let root = table_root(dir.path());
+        let manifest = table.as_native().unwrap().manifest().await.unwrap();
+        let metadata: WebTableMetadata =
+            serde_json::from_slice(&fs::read(root.join(WEB_METADATA_PATH)).unwrap()).unwrap();
+        let snapshot: PublishedSnapshot =
+            serde_json::from_slice(&fs::read(root.join(SNAPSHOT_PATH)).unwrap()).unwrap();
+
+        assert_eq!(metadata.metadata, manifest.config);
+        assert_eq!(
+            metadata.metadata.get("embedding_model"),
+            Some(&"text-embedding-3-large".to_string())
+        );
+        assert_eq!(
+            metadata.metadata.get("llm_uri"),
+            Some(&"openai://responses".to_string())
+        );
+        assert_eq!(snapshot.metadata, metadata.metadata);
+    }
+
+    #[tokio::test]
+    async fn rejects_base_path_backed_tables_for_browser_publish_sidecars() {
+        let dir = tempdir().unwrap();
+        let db = connect(dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        let table = db
+            .create_table("published", make_batch(0, 4))
+            .execute()
+            .await
+            .unwrap();
+
+        let mut manifest = table.as_native().unwrap().manifest().await.unwrap();
+        Arc::make_mut(&mut manifest.fragments)[0].files[0].base_id = Some(7);
+        manifest.base_paths.insert(
+            7,
+            BasePath::new(
+                7,
+                "file:///tmp/external-root".to_string(),
+                Some("external-root".to_string()),
+                true,
+            ),
+        );
+
+        let error = ensure_publishable_snapshot(&build_snapshot_plan(&manifest, None))
+            .expect_err("browser publish sidecars should reject external base paths");
+
+        match error {
+            crate::Error::NotSupported { message } => {
+                assert!(message.contains("base-path"));
+                assert!(message.contains("base_id 7"));
+            }
+            other => panic!("expected not-supported error, got {other:?}"),
+        }
     }
 }

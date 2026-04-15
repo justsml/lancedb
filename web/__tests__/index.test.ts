@@ -177,7 +177,7 @@ describe("@lancedb/lancedb-web", () => {
     });
   });
 
-  it("decodes schema and search results from Arrow IPC and applies published defaults", async () => {
+  it("decodes schema and search results from Arrow IPC without JS-side request defaults", async () => {
     const handle = makeHandle();
     __setWasmModuleLoaderForTests(async () => ({
       open_table: async () => handle,
@@ -198,7 +198,6 @@ describe("@lancedb/lancedb-web", () => {
       JSON.stringify({
         text: "apple",
         vector: [0, 1],
-        vectorColumn: "embedding",
       }),
     );
   });
@@ -230,7 +229,6 @@ describe("@lancedb/lancedb-web", () => {
     expect(handle.search).toHaveBeenCalledWith(
       JSON.stringify({
         vector: [0, 1],
-        vectorColumn: "embedding",
       }),
     );
     expect(directOpenMock).not.toHaveBeenCalled();
@@ -412,7 +410,6 @@ describe("@lancedb/lancedb-web", () => {
     expect(handle.search).toHaveBeenCalledWith(
       JSON.stringify({
         vector: [0, 1],
-        vectorColumn: "embedding",
       }),
     );
   });
@@ -435,7 +432,7 @@ describe("@lancedb/lancedb-web", () => {
     ).resolves.toHaveProperty("numRows", 2);
   });
 
-  it("fails fast when published metadata advertises no FTS index", async () => {
+  it("forwards text search to wasm even when published metadata advertises no FTS index", async () => {
     const handle = makeHandle();
     __setWasmModuleLoaderForTests(async () => ({
       open_table: async () => handle,
@@ -448,8 +445,13 @@ describe("@lancedb/lancedb-web", () => {
       }),
     });
 
-    await expect(table.search({ text: "apple" })).rejects.toThrow(/full-text search indexed columns/);
-    expect(handle.search).not.toHaveBeenCalled();
+    await table.search({ text: "apple" });
+
+    expect(handle.search).toHaveBeenCalledWith(
+      JSON.stringify({
+        text: "apple",
+      }),
+    );
   });
 
   it("fails fast when range support is missing", async () => {

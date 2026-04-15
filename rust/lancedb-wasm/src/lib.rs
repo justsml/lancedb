@@ -601,12 +601,6 @@ fn apply_published_request_defaults(
         });
 
     if let Some(text_request) = request.text.take() {
-        if published_metadata.is_some_and(|metadata| metadata.fts_columns().is_empty()) {
-            return Err(Error::InvalidInput {
-                message: "this table does not advertise any full-text search indexed columns in its published metadata".to_string(),
-            });
-        }
-
         request.text = Some(apply_published_text_defaults(
             text_request,
             published_metadata,
@@ -783,11 +777,7 @@ pub(crate) fn object_store_table_path(table_url: &Url) -> Result<Path> {
 
 #[cfg(target_arch = "wasm32")]
 async fn execute_browser_search(table: &BrowserTable, request: SearchRequest) -> Result<Vec<u8>> {
-    let result_schema = table.result_schema(&request)?;
     let batches = table.search_batches(request).await?;
-    if batches.is_empty() {
-        return schema_to_ipc_file(&result_schema);
-    }
     batches_to_ipc_file(&batches)
 }
 
@@ -972,4 +962,141 @@ pub async fn open_table(
         .await
         .map_err(wasm_err)?;
     Ok(WasmRemoteSearchTable { inner })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn empty_request() -> SearchRequest {
+        SearchRequest {
+            vector: None,
+            text: None,
+            distance_type: None,
+            filter: None,
+            select: None,
+            limit: None,
+            offset: None,
+            vector_column: None,
+            prefilter: None,
+            with_row_id: None,
+            fast_search: None,
+        }
+    }
+
+    fn published_state(
+        default_vector_column: Option<&str>,
+        fts_columns: Vec<&str>,
+    ) -> ResolvedPublishedState {
+        let default_vector_column = default_vector_column.map(ToOwned::to_owned);
+        let vector_columns = default_vector_column.iter().cloned().collect();
+
+        ResolvedPublishedState {
+            current_version: Some(7),
+            latest_version_url: LATEST_VERSION_PATH.to_string(),
+            manifest_url: MANIFEST_PATH.to_string(),
+            snapshot: None,
+            table_metadata: Some(PublishedTableMetadata {
+                version: 7,
+                manifest_path: "_versions/7.manifest".to_string(),
+                manifest_size_bytes: Some(1024),
+                manifest_naming_scheme: "v2".to_string(),
+                latest_manifest_path: MANIFEST_PATH.to_string(),
+                latest_version_path: LATEST_VERSION_PATH.to_string(),
+                web_metadata_path: WEB_METADATA_PATH.to_string(),
+                snapshot_path: SNAPSHOT_PATH.to_string(),
+                default_vector_column,
+                vector_columns,
+                fts_columns: fts_columns.into_iter().map(ToOwned::to_owned).collect(),
+                metadata: HashMap::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn published_text_queries_pass_through_when_no_fts_columns_are_advertised() {
+        let mut request = empty_request();
+        request.text = Some(TextRequest::Query("apple".to_string()));
+
+        let request = apply_published_request_defaults(request, &published_state(None, vec![]))
+            .expect("published defaults should not reject pass-through text queries");
+
+        match request.text {
+            Some(TextRequest::Query(query)) => assert_eq!(query, "apple"),
+            other => panic!("expected query text request to remain unchanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn published_text_defaults_fill_advertised_columns() {
+        let mut request = empty_request();
+        request.text = Some(TextRequest::Query("apple".to_string()));
+
+        let request =
+            apply_published_request_defaults(request, &published_state(None, vec!["doc"]))
+                .expect("published defaults should inject advertised FTS columns");
+
+        match request.text {
+            Some(TextRequest::Structured { query, columns }) => {
+                assert_eq!(query, "apple");
+                assert_eq!(columns, Some(vec!["doc".to_string()]));
+            }
+            other => panic!("expected structured text request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn published_text_defaults_still_validate_explicit_columns() {
+        let mut request = empty_request();
+        request.text = Some(TextRequest::Structured {
+            query: "apple".to_string(),
+            columns: Some(vec!["title".to_string()]),
+        });
+
+        let error = apply_published_request_defaults(request, &published_state(None, vec!["doc"]))
+            .expect_err("published defaults should reject unadvertised text columns");
+
+        match error {
+            Error::InvalidInput { message } => {
+                assert!(message.contains("not advertised"));
+                assert!(message.contains("title"));
+            }
+            other => panic!("expected invalid input error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn published_metadata_deserializes_user_metadata_map() {
+        let metadata: PublishedTableMetadata = serde_json::from_value(json!({
+            "version": 7,
+            "manifestPath": "_versions/7.manifest",
+            "manifestSizeBytes": 1024,
+            "manifestNamingScheme": "v2",
+            "latestManifestPath": "_latest.manifest",
+            "latestVersionPath": "_latest.version",
+            "webMetadataPath": "_web.json",
+            "snapshotPath": "_snapshot.json",
+            "vectorColumns": ["embedding"],
+            "ftsColumns": ["doc"],
+            "defaultVectorColumn": "embedding",
+            "metadata": {
+                "embedding_model": "text-embedding-3-large",
+                "llm_uri": "openai://responses"
+            }
+        }))
+        .expect("published metadata JSON should deserialize");
+
+        assert_eq!(
+            metadata.metadata.get("embedding_model"),
+            Some(&"text-embedding-3-large".to_string())
+        );
+        assert_eq!(
+            metadata.metadata.get("llm_uri"),
+            Some(&"openai://responses".to_string())
+        );
+    }
 }

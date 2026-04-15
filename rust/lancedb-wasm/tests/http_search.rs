@@ -464,6 +464,48 @@ async fn refresh_uses_latest_version_sidecar_when_snapshot_is_unchanged() {
 }
 
 #[tokio::test]
+async fn text_search_still_works_when_published_metadata_advertises_no_fts_columns() {
+    let fixture = TestFixture::new().await;
+    let web_metadata_path = fixture.root.path().join("search_table.lance/_web.json");
+    let mut web_metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&web_metadata_path).unwrap()).unwrap();
+    web_metadata["ftsColumns"] = serde_json::json!([]);
+    web_metadata["metadata"] = serde_json::json!({
+        "embedding_model": "text-embedding-3-large",
+        "llm_uri": "openai://responses"
+    });
+    fs::write(
+        &web_metadata_path,
+        serde_json::to_vec_pretty(&web_metadata).unwrap(),
+    )
+    .unwrap();
+
+    let remote = fixture.open_remote(true, OpenTableOptions::default()).await;
+    let batches = decode_batches(
+        remote
+            .search(SearchRequest {
+                vector: None,
+                text: Some(TextRequest::Query("apple".into())),
+                distance_type: None,
+                filter: None,
+                select: Some(SelectRequest::Columns(vec!["id".into(), "doc".into()])),
+                limit: Some(2),
+                offset: None,
+                vector_column: None,
+                prefilter: None,
+                with_row_id: None,
+                fast_search: None,
+            })
+            .await
+            .unwrap(),
+    );
+
+    let ids = ids_from_batches(&batches);
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(|id| [1, 3].contains(id)));
+}
+
+#[tokio::test]
 async fn supports_manifest_url_override() {
     let fixture = TestFixture::new().await;
     let source_manifest = fixture

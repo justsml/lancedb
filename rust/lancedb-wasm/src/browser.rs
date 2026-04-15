@@ -115,11 +115,13 @@ impl BrowserTable {
         })
     }
 
-    pub fn schema(&self) -> &LanceSchema {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn schema(&self) -> &LanceSchema {
         &self.manifest.schema
     }
 
-    pub fn version(&self) -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn version(&self) -> u64 {
         self.manifest.version
     }
 
@@ -130,6 +132,13 @@ impl BrowserTable {
             .as_deref()
             .map(parse_expression)
             .transpose()?;
+
+        if request.fast_search.is_some() {
+            return Err(Error::NotSupported {
+                message: "browser search does not support the fastSearch option; omit it for now"
+                    .to_string(),
+            });
+        }
         let output_plan = OutputPlan::new(
             &self.manifest.schema,
             &mode,
@@ -217,24 +226,6 @@ impl BrowserTable {
 
         Ok(vec![output_plan.materialize_rows(&rows)?])
     }
-
-    pub fn result_schema(&self, request: &SearchRequest) -> Result<ArrowSchema> {
-        let mode = SearchMode::from_request(&self.manifest.schema, request)?;
-        let filter_expr = request
-            .filter
-            .as_deref()
-            .map(parse_expression)
-            .transpose()?;
-        Ok(OutputPlan::new(
-            &self.manifest.schema,
-            &mode,
-            request.select.as_ref(),
-            request.with_row_id.unwrap_or(false),
-            filter_expr.as_ref(),
-        )?
-        .schema)
-    }
-
     fn collect_rows_from_batch(
         &self,
         batch: Arc<RecordBatch>,
@@ -888,26 +879,6 @@ impl OutputPlan {
             .collect::<Result<Vec<_>>>()?;
         RecordBatch::try_new(Arc::new(self.schema.clone()), columns).map_err(Error::from)
     }
-
-    fn materialize_row(&self, row: &ResultRow) -> Result<RecordBatch> {
-        let row_scores = RowScores {
-            distance: row.distance,
-            text_score: row.text_score,
-            relevance_score: row.relevance_score,
-        };
-        let context = RowContext::new(&row.batch, row.row_index, row_scores);
-        let columns = self
-            .items
-            .iter()
-            .map(|item| item.materialize(&context, &row.batch, row.row_index))
-            .collect::<Result<Vec<_>>>()?;
-        RecordBatch::try_new_with_options(
-            Arc::new(self.schema.clone()),
-            columns,
-            &RecordBatchOptions::new().with_row_count(Some(1)),
-        )
-        .map_err(Error::from)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1009,19 +980,18 @@ fn finalize_ranked_rows(
 ) -> Vec<ResultRow> {
     rows.sort_by(comparator);
     let window = limit.map(|limit| limit.saturating_add(offset));
-    let mut rows = if postfilter {
-        take_window(rows, window)
+    let rows = if postfilter {
+        filter_to_window(rows, window)
+    } else {
+        let mut filtered = rows
             .into_iter()
             .filter(|row| row.filter_pass)
-            .collect::<Vec<_>>()
-    } else {
-        rows.into_iter()
-            .filter(|row| row.filter_pass)
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if let Some(window) = window {
+            filtered.truncate(window);
+        }
+        filtered
     };
-    if !postfilter && let Some(window) = window {
-        rows.truncate(window);
-    }
     apply_offset_limit(rows, limit, offset)
 }
 
@@ -1032,26 +1002,33 @@ fn finalize_hybrid_source_rows(
     comparator: impl Fn(&ResultRow, &ResultRow) -> Ordering,
 ) -> Vec<ResultRow> {
     rows.sort_by(comparator);
-    let mut rows = if postfilter {
-        take_window(rows, Some(window))
+    if postfilter {
+        filter_to_window(rows, Some(window))
+    } else {
+        let mut rows = rows
             .into_iter()
             .filter(|row| row.filter_pass)
-            .collect::<Vec<_>>()
-    } else {
-        rows.into_iter()
-            .filter(|row| row.filter_pass)
-            .collect::<Vec<_>>()
-    };
-    if !postfilter {
+            .collect::<Vec<_>>();
         rows.truncate(window);
+        rows
     }
-    rows
 }
 
-fn take_window(rows: Vec<ResultRow>, window: Option<usize>) -> Vec<ResultRow> {
+fn filter_to_window(mut rows: Vec<ResultRow>, window: Option<usize>) -> Vec<ResultRow> {
     match window {
-        Some(window) => rows.into_iter().take(window).collect(),
-        None => rows,
+        Some(window) => {
+            let mut filtered = Vec::with_capacity(window.min(rows.len()));
+            for row in rows.drain(..) {
+                if row.filter_pass {
+                    filtered.push(row);
+                }
+                if filtered.len() == window {
+                    break;
+                }
+            }
+            filtered
+        }
+        None => rows.into_iter().filter(|row| row.filter_pass).collect(),
     }
 }
 
@@ -1708,5 +1685,132 @@ mod tests {
 
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].row_id, Some(20));
+    }
+
+    #[test]
+    fn ranked_postfilter_backfills_after_filtered_rows() {
+        let empty_batch = Arc::new(RecordBatch::new_empty(Arc::new(Schema::empty())));
+        let make_row = |row_id: u64, ordinal: u64, distance: f32, filter_pass: bool| -> ResultRow {
+            ResultRow {
+                ordinal,
+                batch: empty_batch.clone(),
+                row_index: 0,
+                row_id: Some(row_id),
+                filter_pass,
+                distance: Some(distance),
+                text_score: None,
+                relevance_score: None,
+            }
+        };
+
+        let ranked = finalize_ranked_rows(
+            vec![
+                make_row(10, 0, 0.0, false),
+                make_row(20, 1, 1.0, true),
+                make_row(30, 2, 2.0, true),
+            ],
+            Some(2),
+            0,
+            true,
+            sort_by_distance,
+        );
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].row_id, Some(20));
+        assert_eq!(ranked[1].row_id, Some(30));
+    }
+
+    #[test]
+    fn hybrid_postfilter_backfills_source_window() {
+        let empty_batch = Arc::new(RecordBatch::new_empty(Arc::new(Schema::empty())));
+        let make_row = |row_id: u64, ordinal: u64, distance: f32, filter_pass: bool| -> ResultRow {
+            ResultRow {
+                ordinal,
+                batch: empty_batch.clone(),
+                row_index: 0,
+                row_id: Some(row_id),
+                filter_pass,
+                distance: Some(distance),
+                text_score: None,
+                relevance_score: None,
+            }
+        };
+
+        let ranked = finalize_hybrid_source_rows(
+            vec![
+                make_row(10, 0, 0.0, false),
+                make_row(20, 1, 1.0, true),
+                make_row(30, 2, 2.0, true),
+            ],
+            2,
+            true,
+            sort_by_distance,
+        );
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].row_id, Some(20));
+        assert_eq!(ranked[1].row_id, Some(30));
+    }
+
+    #[test]
+    fn postfilter_respects_offset_after_backfill() {
+        let empty_batch = Arc::new(RecordBatch::new_empty(Arc::new(Schema::empty())));
+        let make_row = |row_id: u64, ordinal: u64, distance: f32, filter_pass: bool| -> ResultRow {
+            ResultRow {
+                ordinal,
+                batch: empty_batch.clone(),
+                row_index: 0,
+                row_id: Some(row_id),
+                filter_pass,
+                distance: Some(distance),
+                text_score: None,
+                relevance_score: None,
+            }
+        };
+
+        let ranked = finalize_ranked_rows(
+            vec![
+                make_row(10, 0, 0.0, false),
+                make_row(20, 1, 1.0, true),
+                make_row(30, 2, 2.0, true),
+            ],
+            Some(1),
+            1,
+            true,
+            sort_by_distance,
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].row_id, Some(30));
+    }
+
+    #[tokio::test]
+    async fn fast_search_option_rejected() {
+        let fixture = TestFixture::new().await;
+        let table = BrowserTable::open(
+            &fixture.table_url(),
+            &OpenTableOptions::default(),
+            &format!("{}_latest.manifest", fixture.table_url()),
+        )
+        .await
+        .unwrap();
+
+        let result = table
+            .search_batches(SearchRequest {
+                vector: None,
+                text: None,
+                distance_type: None,
+                filter: None,
+                select: None,
+                limit: Some(1),
+                offset: None,
+                vector_column: None,
+                prefilter: None,
+                with_row_id: None,
+                fast_search: Some(true),
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::NotSupported { .. })));
     }
 }

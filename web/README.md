@@ -6,6 +6,8 @@ Read-only WASM search client for HTTP-hosted Lance tables.
 
 `@lancedb/lancedb-web` opens a published Lance table over HTTP, reads Arrow IPC results,
 and executes browser-side search against the published manifest and data files.
+Published request defaults are resolved inside the WASM runtime, so the JS layer
+mostly forwards `search()` requests unchanged.
 
 ```ts
 import { openTable } from "@lancedb/lancedb-web";
@@ -124,8 +126,8 @@ If you already compute query embeddings with another ONNX package such as
   execution engine and does not support writes.
 - Text search is constrained to the published FTS columns, but scoring happens client-side and
   may not exactly match native/server-side FTS ranking.
-- Browser-side vector ranking currently supports `l2`, `cosine`, and `dot`. `hamming` is not
-  supported in the browser execution path.
+- Browser-side vector ranking supports `l2`, `cosine`, and `dot` only.
+- Native-only query knobs such as `fastSearch` are intentionally not exposed by this browser SDK.
 - Performance is best for smaller published tables and search-oriented snapshots. Large-table
   browser queries still depend on HTTP range reads and local ranking work.
 
