@@ -62,10 +62,7 @@ export interface SearchRequest {
 
 /** Read-only handle for a published HTTP-hosted table. */
 export interface RemoteSearchTable {
-  /**
-   * @deprecated Published user metadata is not yet guaranteed to round-trip for
-   * browser-published tables.
-   */
+  /** Arbitrary user-defined key-value metadata published with the table. */
   readonly metadata: Record<string, string>;
   schema(): Promise<Schema>;
   search(request: SearchRequest): Promise<ArrowTable>;

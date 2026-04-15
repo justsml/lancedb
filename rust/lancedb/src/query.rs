@@ -20,6 +20,7 @@ use lance_index::vector::DIST_COL;
 
 use crate::DistanceType;
 use crate::error::{Error, Result};
+use crate::expr::expr_to_sql_string;
 use crate::rerankers::rrf::RRFReranker;
 use crate::rerankers::{NormalizeMethod, Reranker, check_reranker_result};
 use crate::table::BaseTable;
@@ -770,6 +771,71 @@ impl Default for QueryRequest {
     }
 }
 
+/// Shared projection form for remote and server-side query serializers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedSelect {
+    All,
+    Columns(Vec<String>),
+    Dynamic(Vec<(String, String)>),
+    Expr(Vec<(String, String)>),
+}
+
+/// Shared base query fields used by remote and server-side adapters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedQueryBase {
+    pub offset: Option<usize>,
+    pub filter_sql: Option<String>,
+    pub select: ResolvedSelect,
+    pub prefilter: bool,
+    pub fast_search: bool,
+    pub with_row_id: bool,
+}
+
+pub(crate) fn resolve_query_base(
+    query: &QueryRequest,
+    substrait_error_message: &'static str,
+) -> Result<ResolvedQueryBase> {
+    Ok(ResolvedQueryBase {
+        offset: query.offset,
+        filter_sql: query
+            .filter
+            .as_ref()
+            .map(|filter| filter_to_sql_string(filter, substrait_error_message))
+            .transpose()?,
+        select: resolve_select(&query.select)?,
+        prefilter: query.prefilter,
+        fast_search: query.fast_search,
+        with_row_id: query.with_row_id,
+    })
+}
+
+pub(crate) fn resolve_select(select: &Select) -> Result<ResolvedSelect> {
+    match select {
+        Select::All => Ok(ResolvedSelect::All),
+        Select::Columns(columns) => Ok(ResolvedSelect::Columns(columns.clone())),
+        Select::Dynamic(pairs) => Ok(ResolvedSelect::Dynamic(pairs.clone())),
+        Select::Expr(pairs) => Ok(ResolvedSelect::Expr(
+            pairs
+                .iter()
+                .map(|(name, expr)| expr_to_sql_string(expr).map(|sql| (name.clone(), sql)))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+    }
+}
+
+pub(crate) fn filter_to_sql_string(
+    filter: &QueryFilter,
+    substrait_error_message: &'static str,
+) -> Result<String> {
+    match filter {
+        QueryFilter::Sql(sql) => Ok(sql.clone()),
+        QueryFilter::Substrait(_) => Err(Error::NotSupported {
+            message: substrait_error_message.to_string(),
+        }),
+        QueryFilter::Datafusion(expr) => expr_to_sql_string(expr),
+    }
+}
+
 /// A builder for LanceDB queries.
 ///
 /// See [`crate::Table::query`] for more details on queries
@@ -1486,7 +1552,66 @@ mod tests {
     use rand::seq::IndexedRandom;
     use tempfile::tempdir;
 
+    use crate::expr::{col, lit};
     use crate::{Table, connect, database::CreateTableMode, index::Index};
+
+    #[test]
+    fn resolve_query_base_serializes_expr_projections_and_filters() {
+        let filter_expr = col("age").gt(lit(18));
+        let projection_expr = col("id") * lit(2);
+        let query = QueryRequest {
+            offset: Some(7),
+            filter: Some(QueryFilter::Datafusion(filter_expr.clone())),
+            select: Select::Expr(vec![("id2".to_string(), projection_expr.clone())]),
+            fast_search: true,
+            with_row_id: true,
+            prefilter: false,
+            ..Default::default()
+        };
+
+        let resolved =
+            resolve_query_base(&query, "Substrait filters are not supported here").unwrap();
+
+        assert_eq!(resolved.offset, Some(7));
+        assert_eq!(
+            resolved.filter_sql,
+            Some(crate::expr::expr_to_sql_string(&filter_expr).unwrap())
+        );
+        assert_eq!(
+            resolved.select,
+            ResolvedSelect::Expr(vec![(
+                "id2".to_string(),
+                crate::expr::expr_to_sql_string(&projection_expr).unwrap(),
+            )])
+        );
+        assert!(resolved.fast_search);
+        assert!(resolved.with_row_id);
+        assert!(!resolved.prefilter);
+    }
+
+    #[test]
+    fn resolve_query_base_uses_contextual_substrait_errors() {
+        let query = QueryRequest {
+            filter: Some(QueryFilter::Substrait(Arc::<[u8]>::from(vec![1_u8, 2, 3]))),
+            ..Default::default()
+        };
+
+        let error = resolve_query_base(
+            &query,
+            "Substrait filters are not supported for this adapter",
+        )
+        .expect_err("substrait filters should be rejected");
+
+        match error {
+            Error::NotSupported { message } => {
+                assert_eq!(
+                    message,
+                    "Substrait filters are not supported for this adapter"
+                );
+            }
+            other => panic!("expected not supported error, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn test_setters_getters() {

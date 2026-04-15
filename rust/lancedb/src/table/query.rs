@@ -8,7 +8,8 @@ use crate::connection::PushdownOperation;
 use crate::error::{Error, Result};
 use crate::expr::expr_to_sql_string;
 use crate::query::{
-    DEFAULT_TOP_K, QueryExecutionOptions, QueryFilter, QueryRequest, Select, VectorQueryRequest,
+    DEFAULT_TOP_K, QueryExecutionOptions, QueryFilter, QueryRequest, ResolvedSelect, Select,
+    VectorQueryRequest, resolve_query_base,
 };
 use crate::utils::{MaxBatchLengthStream, TimeoutStream, default_vector_column};
 use arrow::array::{AsArray, FixedSizeListBuilder, Float32Builder};
@@ -332,39 +333,14 @@ fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
         AnyQuery::VectorQuery(vq) => {
             // Extract the query vector(s)
             let vector = extract_query_vector(&vq.query_vector)?;
-
-            // Convert filter to SQL string
-            let filter = match &vq.base.filter {
-                Some(f) => Some(filter_to_sql(f)?),
-                None => None,
-            };
-
-            // Convert select to columns list
-            let columns = match &vq.base.select {
-                Select::All => None,
-                Select::Columns(cols) => Some(Box::new(QueryTableRequestColumns {
-                    column_names: Some(cols.clone()),
-                    column_aliases: None,
-                })),
-                Select::Dynamic(_) => {
-                    return Err(Error::NotSupported {
-                        message:
-                            "Dynamic column selection is not supported for server-side queries"
-                                .to_string(),
-                    });
-                }
-                Select::Expr(pairs) => {
-                    let sql_pairs: crate::Result<Vec<(String, String)>> = pairs
-                        .iter()
-                        .map(|(name, expr)| expr_to_sql_string(expr).map(|sql| (name.clone(), sql)))
-                        .collect();
-                    let sql_pairs = sql_pairs?;
-                    Some(Box::new(QueryTableRequestColumns {
-                        column_names: None,
-                        column_aliases: Some(sql_pairs.into_iter().collect()),
-                    }))
-                }
-            };
+            let resolved = resolve_query_base(
+                &vq.base,
+                "Substrait filters are not supported for server-side queries",
+            )?;
+            let columns = namespace_columns(
+                resolved.select,
+                "Dynamic column selection is not supported for server-side queries",
+            )?;
 
             // Check for unsupported features
             if vq.base.reranker.is_some() {
@@ -392,21 +368,21 @@ fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
 
             Ok(NsQueryTableRequest {
                 id: None, // Will be set in namespace_query
-                k: vq.base.limit.unwrap_or(10) as i32,
+                k: vq.base.limit.unwrap_or(DEFAULT_TOP_K) as i32,
                 vector: Box::new(vector),
                 vector_column: vq.column.clone(),
-                filter,
+                filter: resolved.filter_sql,
                 columns,
-                offset: vq.base.offset.map(|o| o as i32),
+                offset: resolved.offset.map(|o| o as i32),
                 distance_type: vq.distance_type.map(|dt| dt.to_string()),
                 nprobes: Some(vq.minimum_nprobes as i32),
                 ef: vq.ef.map(|e| e as i32),
                 refine_factor: vq.refine_factor.map(|r| r as i32),
                 lower_bound: vq.lower_bound,
                 upper_bound: vq.upper_bound,
-                prefilter: Some(vq.base.prefilter),
-                fast_search: Some(vq.base.fast_search),
-                with_row_id: Some(vq.base.with_row_id),
+                prefilter: Some(resolved.prefilter),
+                fast_search: Some(resolved.fast_search),
+                with_row_id: Some(resolved.with_row_id),
                 bypass_vector_index: Some(!vq.use_index),
                 full_text_query,
                 ..Default::default()
@@ -420,33 +396,14 @@ fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
                         .to_string(),
                 });
             }
-
-            let filter = q.filter.as_ref().map(filter_to_sql).transpose()?;
-
-            let columns = match &q.select {
-                Select::All => None,
-                Select::Columns(cols) => Some(Box::new(QueryTableRequestColumns {
-                    column_names: Some(cols.clone()),
-                    column_aliases: None,
-                })),
-                Select::Dynamic(_) => {
-                    return Err(Error::NotSupported {
-                        message: "Dynamic columns are not supported for server-side query"
-                            .to_string(),
-                    });
-                }
-                Select::Expr(pairs) => {
-                    let sql_pairs: crate::Result<Vec<(String, String)>> = pairs
-                        .iter()
-                        .map(|(name, expr)| expr_to_sql_string(expr).map(|sql| (name.clone(), sql)))
-                        .collect();
-                    let sql_pairs = sql_pairs?;
-                    Some(Box::new(QueryTableRequestColumns {
-                        column_names: None,
-                        column_aliases: Some(sql_pairs.into_iter().collect()),
-                    }))
-                }
-            };
+            let resolved = resolve_query_base(
+                q,
+                "Substrait filters are not supported for server-side queries",
+            )?;
+            let columns = namespace_columns(
+                resolved.select,
+                "Dynamic columns are not supported for server-side query",
+            )?;
 
             // Handle full text search if present
             let full_text_query = q.full_text_search.as_ref().map(|fts| {
@@ -473,13 +430,13 @@ fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
             Ok(NsQueryTableRequest {
                 id: None, // Will be set by caller
                 vector,
-                k: q.limit.unwrap_or(10) as i32,
-                filter,
+                k: q.limit.unwrap_or(DEFAULT_TOP_K) as i32,
+                filter: resolved.filter_sql,
                 columns,
-                prefilter: Some(q.prefilter),
-                offset: q.offset.map(|o| o as i32),
+                prefilter: Some(resolved.prefilter),
+                offset: resolved.offset.map(|o| o as i32),
                 vector_column: None, // No vector column for plain queries
-                with_row_id: Some(q.with_row_id),
+                with_row_id: Some(resolved.with_row_id),
                 bypass_vector_index: Some(true), // No vector index for plain queries
                 full_text_query,
                 ..Default::default()
@@ -488,13 +445,23 @@ fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
     }
 }
 
-fn filter_to_sql(filter: &QueryFilter) -> Result<String> {
-    match filter {
-        QueryFilter::Sql(sql) => Ok(sql.clone()),
-        QueryFilter::Substrait(_) => Err(Error::NotSupported {
-            message: "Substrait filters are not supported for server-side queries".to_string(),
+fn namespace_columns(
+    select: ResolvedSelect,
+    dynamic_error_message: &str,
+) -> Result<Option<Box<QueryTableRequestColumns>>> {
+    match select {
+        ResolvedSelect::All => Ok(None),
+        ResolvedSelect::Columns(cols) => Ok(Some(Box::new(QueryTableRequestColumns {
+            column_names: Some(cols),
+            column_aliases: None,
+        }))),
+        ResolvedSelect::Dynamic(_) => Err(Error::NotSupported {
+            message: dynamic_error_message.to_string(),
         }),
-        QueryFilter::Datafusion(expr) => expr_to_sql_string(expr),
+        ResolvedSelect::Expr(pairs) => Ok(Some(Box::new(QueryTableRequestColumns {
+            column_names: None,
+            column_aliases: Some(pairs.into_iter().collect()),
+        }))),
     }
 }
 

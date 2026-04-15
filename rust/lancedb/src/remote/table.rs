@@ -15,7 +15,7 @@ use crate::data::scannable::{PeekedScannable, Scannable, estimate_write_partitio
 use crate::index::Index;
 use crate::index::IndexStatistics;
 use crate::index::waiter::wait_for_index;
-use crate::query::{QueryFilter, QueryRequest, Select, VectorQueryRequest};
+use crate::query::{QueryRequest, ResolvedSelect, VectorQueryRequest, resolve_query_base};
 use crate::table::AddColumnsResult;
 use crate::table::AddResult;
 use crate::table::AlterColumnsResult;
@@ -62,6 +62,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
+
+#[cfg(test)]
+use crate::query::Select;
 
 const REQUEST_TIMEOUT_HEADER: HeaderName = HeaderName::from_static("x-request-timeout-ms");
 const METRIC_TYPE_KEY: &str = "metric_type";
@@ -438,8 +441,13 @@ impl<S: HttpSend> RemoteTable<S> {
         body: &mut serde_json::Value,
         params: &QueryRequest,
     ) -> Result<()> {
-        body["prefilter"] = params.prefilter.into();
-        if let Some(offset) = params.offset {
+        let resolved = resolve_query_base(
+            params,
+            "Substrait filters are not supported for remote queries",
+        )?;
+
+        body["prefilter"] = resolved.prefilter.into();
+        if let Some(offset) = resolved.offset {
             body["offset"] = serde_json::Value::Number(serde_json::Number::from(offset));
         }
 
@@ -448,23 +456,13 @@ impl<S: HttpSend> RemoteTable<S> {
         let limit = params.limit.unwrap_or(isize::MAX as usize);
         body["k"] = serde_json::Value::Number(serde_json::Number::from(limit));
 
-        if let Some(filter) = &params.filter {
-            let filter_sql = match filter {
-                QueryFilter::Sql(sql) => sql.clone(),
-                QueryFilter::Datafusion(expr) => expr_to_sql_string(expr)?,
-                QueryFilter::Substrait(_) => {
-                    return Err(Error::NotSupported {
-                        message: "Substrait filters are not supported for remote queries"
-                            .to_string(),
-                    });
-                }
-            };
+        if let Some(filter_sql) = resolved.filter_sql {
             body["filter"] = serde_json::Value::String(filter_sql);
         }
 
-        match &params.select {
-            Select::All => {}
-            Select::Columns(columns) => {
+        match resolved.select {
+            ResolvedSelect::All => {}
+            ResolvedSelect::Columns(columns) => {
                 body["columns"] = serde_json::Value::Array(
                     columns
                         .iter()
@@ -472,30 +470,20 @@ impl<S: HttpSend> RemoteTable<S> {
                         .collect(),
                 );
             }
-            Select::Dynamic(pairs) => {
+            ResolvedSelect::Dynamic(pairs) | ResolvedSelect::Expr(pairs) => {
                 let alias_map =
                     serde_json::Map::from_iter(pairs.iter().map(|(name, expr)| {
                         (name.clone(), serde_json::Value::String(expr.clone()))
                     }));
                 body["columns"] = alias_map.into();
             }
-            Select::Expr(pairs) => {
-                let alias_map: Result<serde_json::Map<String, serde_json::Value>> = pairs
-                    .iter()
-                    .map(|(name, expr)| {
-                        expr_to_sql_string(expr)
-                            .map(|sql| (name.clone(), serde_json::Value::String(sql)))
-                    })
-                    .collect();
-                body["columns"] = alias_map?.into();
-            }
         }
 
-        if params.fast_search {
+        if resolved.fast_search {
             body["fast_search"] = serde_json::Value::Bool(true);
         }
 
-        if params.with_row_id {
+        if resolved.with_row_id {
             body["with_row_id"] = serde_json::Value::Bool(true);
         }
 

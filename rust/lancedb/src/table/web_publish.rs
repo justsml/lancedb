@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,18 +13,17 @@ use lance_table::io::commit::{
 };
 use lance_table::io::deletion::relative_deletion_file_path;
 use lance_table::io::manifest::read_manifest;
+use lancedb_read_protocol::{
+    LATEST_MANIFEST_PATH, LATEST_VERSION_PATH, PublishedBasePath, PublishedFile,
+    PublishedSearchCapabilities, PublishedSnapshot, PublishedTableMetadata, SNAPSHOT_PATH,
+    WEB_METADATA_PATH,
+};
 use log::warn;
 use object_store::ObjectMeta;
 use object_store::path::Path;
-use serde::{Deserialize, Serialize};
 
 use crate::utils::supported_vector_data_type;
 use crate::{Error, Result};
-
-pub(crate) const LATEST_MANIFEST_PATH: &str = "_latest.manifest";
-pub(crate) const LATEST_VERSION_PATH: &str = "_latest.version";
-pub(crate) const WEB_METADATA_PATH: &str = "_web.json";
-pub(crate) const SNAPSHOT_PATH: &str = "_snapshot.json";
 
 const WEB_METADATA_PREFIX: &str = "lancedb:web:";
 const MANIFEST_NAMING_SCHEME_KEY: &str = "lancedb:web:manifest_naming_scheme";
@@ -47,70 +46,8 @@ impl WebPublishCommitHandler {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct WebSearchCapabilities {
-    default_vector_column: Option<String>,
-    vector_columns: Vec<String>,
-    fts_columns: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct WebTableMetadata {
-    version: u64,
-    manifest_path: String,
-    manifest_size_bytes: Option<u64>,
-    manifest_naming_scheme: String,
-    latest_manifest_path: String,
-    latest_version_path: String,
-    web_metadata_path: String,
-    snapshot_path: String,
-    default_vector_column: Option<String>,
-    vector_columns: Vec<String>,
-    fts_columns: Vec<String>,
-    #[serde(default)]
-    metadata: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct PublishedSnapshot {
-    version: u64,
-    manifest_path: String,
-    manifest_size_bytes: Option<u64>,
-    manifest_naming_scheme: String,
-    latest_manifest_path: String,
-    latest_version_path: String,
-    web_metadata_path: String,
-    snapshot_path: String,
-    default_vector_column: Option<String>,
-    vector_columns: Vec<String>,
-    fts_columns: Vec<String>,
-    #[serde(default)]
-    metadata: HashMap<String, String>,
-    is_complete: bool,
-    base_paths: Vec<PublishedBasePath>,
-    files: Vec<PublishedFile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct PublishedBasePath {
-    id: u32,
-    name: Option<String>,
-    path: String,
-    is_dataset_root: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct PublishedFile {
-    path: String,
-    kind: String,
-    size_bytes: Option<u64>,
-    base_id: Option<u32>,
-}
+type WebSearchCapabilities = PublishedSearchCapabilities;
+type WebTableMetadata = PublishedTableMetadata;
 
 #[derive(Debug, Clone)]
 struct SnapshotPlan {
@@ -552,9 +489,7 @@ async fn publish_sidecars(
         latest_version_path: LATEST_VERSION_PATH.to_string(),
         web_metadata_path: WEB_METADATA_PATH.to_string(),
         snapshot_path: SNAPSHOT_PATH.to_string(),
-        default_vector_column: capabilities.default_vector_column.clone(),
-        vector_columns: capabilities.vector_columns.clone(),
-        fts_columns: capabilities.fts_columns.clone(),
+        capabilities: capabilities.clone(),
         metadata: published_metadata.clone(),
     };
     let metadata_json = serde_json::to_vec_pretty(&metadata).map_err(|source| Error::Runtime {
@@ -614,9 +549,7 @@ async fn publish_sidecars(
         latest_version_path: LATEST_VERSION_PATH.to_string(),
         web_metadata_path: WEB_METADATA_PATH.to_string(),
         snapshot_path: SNAPSHOT_PATH.to_string(),
-        default_vector_column: capabilities.default_vector_column.clone(),
-        vector_columns: capabilities.vector_columns.clone(),
-        fts_columns: capabilities.fts_columns.clone(),
+        capabilities: capabilities.clone(),
         metadata: published_metadata,
         is_complete: snapshot_plan.is_complete,
         base_paths: snapshot_plan.base_paths.clone(),
@@ -829,13 +762,25 @@ mod tests {
             serde_json::from_slice(&fs::read(root.join(SNAPSHOT_PATH)).unwrap()).unwrap();
         let manifest = table.as_native().unwrap().manifest().await.unwrap();
 
-        assert_eq!(metadata.default_vector_column.as_deref(), Some("vector"));
-        assert_eq!(metadata.vector_columns, vec!["vector".to_string()]);
-        assert_eq!(metadata.fts_columns, vec!["text".to_string()]);
+        assert_eq!(
+            metadata.capabilities.default_vector_column.as_deref(),
+            Some("vector")
+        );
+        assert_eq!(
+            metadata.capabilities.vector_columns,
+            vec!["vector".to_string()]
+        );
+        assert_eq!(metadata.capabilities.fts_columns, vec!["text".to_string()]);
         assert_eq!(metadata.metadata, manifest.config);
-        assert_eq!(snapshot.default_vector_column.as_deref(), Some("vector"));
-        assert_eq!(snapshot.vector_columns, vec!["vector".to_string()]);
-        assert_eq!(snapshot.fts_columns, vec!["text".to_string()]);
+        assert_eq!(
+            snapshot.capabilities.default_vector_column.as_deref(),
+            Some("vector")
+        );
+        assert_eq!(
+            snapshot.capabilities.vector_columns,
+            vec!["vector".to_string()]
+        );
+        assert_eq!(snapshot.capabilities.fts_columns, vec!["text".to_string()]);
         assert_eq!(snapshot.metadata, manifest.config);
         assert!(snapshot.is_complete);
         assert!(

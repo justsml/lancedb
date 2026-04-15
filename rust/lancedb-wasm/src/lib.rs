@@ -4,7 +4,7 @@
 //! Read-only HTTP search bindings for LanceDB tables.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(target_arch = "wasm32")]
@@ -37,6 +37,11 @@ mod browser;
 mod browser_expr;
 #[cfg(target_arch = "wasm32")]
 use browser::BrowserTable;
+use lancedb_read_protocol::{
+    LATEST_MANIFEST_PATH, LATEST_VERSION_PATH, PublishedSearchMetadataExt, PublishedSnapshot,
+    PublishedTableMetadata, SNAPSHOT_PATH, WEB_METADATA_PATH,
+};
+pub use lancedb_read_protocol::{SearchDistanceType, SearchRequest, SelectRequest, TextRequest};
 
 #[cfg(not(target_arch = "wasm32"))]
 use lancedb::{Error, Result, Table};
@@ -152,10 +157,7 @@ mod local_error {
 // Current Lance latest-version resolution relies on listing `_versions/`.
 // For generic static HTTP hosting we instead resolve through a deterministic
 // copy of the latest manifest at this path.
-pub(crate) const MANIFEST_PATH: &str = "_latest.manifest";
-const LATEST_VERSION_PATH: &str = "_latest.version";
-const WEB_METADATA_PATH: &str = "_web.json";
-const SNAPSHOT_PATH: &str = "_snapshot.json";
+pub(crate) const MANIFEST_PATH: &str = LATEST_MANIFEST_PATH;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,92 +170,6 @@ pub struct OpenTableOptions {
     pub latest_version_url: Option<String>,
     pub web_metadata_url: Option<String>,
     pub snapshot_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchRequest {
-    pub vector: Option<Vec<f32>>,
-    pub text: Option<TextRequest>,
-    pub distance_type: Option<SearchDistanceType>,
-    pub filter: Option<String>,
-    pub select: Option<SelectRequest>,
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
-    pub vector_column: Option<String>,
-    pub prefilter: Option<bool>,
-    pub with_row_id: Option<bool>,
-    pub fast_search: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum TextRequest {
-    Query(String),
-    Structured {
-        query: String,
-        columns: Option<Vec<String>>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchDistanceType {
-    #[default]
-    L2,
-    Cosine,
-    Dot,
-    Hamming,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SelectRequest {
-    Columns(Vec<String>),
-    Dynamic(BTreeMap<String, String>),
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PublishedTableMetadata {
-    version: u64,
-    manifest_path: String,
-    manifest_size_bytes: Option<u64>,
-    manifest_naming_scheme: String,
-    latest_manifest_path: String,
-    latest_version_path: String,
-    web_metadata_path: String,
-    snapshot_path: String,
-    default_vector_column: Option<String>,
-    #[serde(default)]
-    vector_columns: Vec<String>,
-    #[serde(default)]
-    fts_columns: Vec<String>,
-    /// Arbitrary user-defined key-value metadata (e.g. embedding model, LLM URI).
-    #[serde(default)]
-    metadata: std::collections::HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PublishedSnapshot {
-    version: u64,
-    manifest_path: String,
-    manifest_size_bytes: Option<u64>,
-    manifest_naming_scheme: String,
-    latest_manifest_path: String,
-    latest_version_path: String,
-    web_metadata_path: String,
-    snapshot_path: String,
-    default_vector_column: Option<String>,
-    #[serde(default)]
-    vector_columns: Vec<String>,
-    #[serde(default)]
-    fts_columns: Vec<String>,
-    is_complete: bool,
-    /// Arbitrary user-defined key-value metadata (e.g. embedding model, LLM URI).
-    #[serde(default)]
-    metadata: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -589,16 +505,7 @@ fn apply_published_request_defaults(
     mut request: SearchRequest,
     published: &ResolvedPublishedState,
 ) -> Result<SearchRequest> {
-    let published_metadata = published
-        .table_metadata
-        .as_ref()
-        .map(PublishedMetadataView::Table)
-        .or_else(|| {
-            published
-                .snapshot
-                .as_ref()
-                .map(PublishedMetadataView::Snapshot)
-        });
+    let published_metadata = published_metadata_view(published);
 
     if let Some(text_request) = request.text.take() {
         request.text = Some(apply_published_text_defaults(
@@ -617,7 +524,7 @@ fn apply_published_request_defaults(
 
 fn apply_published_text_defaults(
     request: TextRequest,
-    published_metadata: Option<PublishedMetadataView<'_>>,
+    published_metadata: Option<&dyn PublishedSearchMetadataExt>,
 ) -> Result<TextRequest> {
     let Some(published_metadata) = published_metadata else {
         return Ok(request);
@@ -655,26 +562,19 @@ fn apply_published_text_defaults(
     })
 }
 
-#[derive(Clone, Copy)]
-enum PublishedMetadataView<'a> {
-    Table(&'a PublishedTableMetadata),
-    Snapshot(&'a PublishedSnapshot),
-}
-
-impl PublishedMetadataView<'_> {
-    fn default_vector_column(&self) -> Option<&str> {
-        match self {
-            Self::Table(metadata) => metadata.default_vector_column.as_deref(),
-            Self::Snapshot(snapshot) => snapshot.default_vector_column.as_deref(),
-        }
-    }
-
-    fn fts_columns(&self) -> &[String] {
-        match self {
-            Self::Table(metadata) => metadata.fts_columns.as_slice(),
-            Self::Snapshot(snapshot) => snapshot.fts_columns.as_slice(),
-        }
-    }
+fn published_metadata_view(
+    published: &ResolvedPublishedState,
+) -> Option<&dyn PublishedSearchMetadataExt> {
+    published
+        .table_metadata
+        .as_ref()
+        .map(|metadata| metadata as &dyn PublishedSearchMetadataExt)
+        .or_else(|| {
+            published
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot as &dyn PublishedSearchMetadataExt)
+        })
 }
 
 pub(crate) fn build_open_store(
@@ -968,6 +868,7 @@ pub async fn open_table(
 mod tests {
     use std::collections::HashMap;
 
+    use lancedb_read_protocol::PublishedSearchCapabilities;
     use serde_json::json;
 
     use super::*;
@@ -1009,9 +910,11 @@ mod tests {
                 latest_version_path: LATEST_VERSION_PATH.to_string(),
                 web_metadata_path: WEB_METADATA_PATH.to_string(),
                 snapshot_path: SNAPSHOT_PATH.to_string(),
-                default_vector_column,
-                vector_columns,
-                fts_columns: fts_columns.into_iter().map(ToOwned::to_owned).collect(),
+                capabilities: PublishedSearchCapabilities {
+                    default_vector_column,
+                    vector_columns,
+                    fts_columns: fts_columns.into_iter().map(ToOwned::to_owned).collect(),
+                },
                 metadata: HashMap::new(),
             }),
         }

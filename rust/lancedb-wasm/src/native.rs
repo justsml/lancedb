@@ -195,7 +195,7 @@ pub(crate) async fn execute_table_search(table: &Table, request: SearchRequest) 
                 query = query.column(vector_column);
             }
             if let Some(distance_type) = request.distance_type {
-                query = query.distance_type(distance_type.into());
+                query = query.distance_type(native_distance_type(distance_type));
             }
             query = apply_common_query(query, &request);
             execute_query(query).await
@@ -257,13 +257,11 @@ where
     batches_to_ipc_file(&batches)
 }
 
-impl From<SearchDistanceType> for lancedb::DistanceType {
-    fn from(value: SearchDistanceType) -> Self {
-        match value {
-            SearchDistanceType::L2 => Self::L2,
-            SearchDistanceType::Cosine => Self::Cosine,
-            SearchDistanceType::Dot => Self::Dot,
-            SearchDistanceType::Hamming => Self::Hamming,
-        }
+fn native_distance_type(value: SearchDistanceType) -> lancedb::DistanceType {
+    match value {
+        SearchDistanceType::L2 => lancedb::DistanceType::L2,
+        SearchDistanceType::Cosine => lancedb::DistanceType::Cosine,
+        SearchDistanceType::Dot => lancedb::DistanceType::Dot,
+        SearchDistanceType::Hamming => lancedb::DistanceType::Hamming,
     }
 }

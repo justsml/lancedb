@@ -5041,6 +5041,7 @@ dependencies = [
  "lance-namespace-impls",
  "lance-table",
  "lance-testing",
+ "lancedb-read-protocol",
  "lazy_static",
  "log",
  "moka",
@@ -5116,6 +5117,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lancedb-read-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "lancedb-wasm"
 version = "0.1.0"
 dependencies = [
@@ -5139,6 +5147,7 @@ dependencies = [
  "lance-io",
  "lance-table",
  "lancedb",
+ "lancedb-read-protocol",
  "object_store",
  "serde",
  "serde_json",
