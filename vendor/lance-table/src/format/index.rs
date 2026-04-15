@@ -226,6 +226,39 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
     }
 }
 
+/// Returns a [`CacheCodec`](lance_core::cache::CacheCodec) for `Vec<IndexMetadata>`.
+type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
+
+fn serialize_index_metadata(
+    any: &ArcAny,
+    writer: &mut dyn std::io::Write,
+) -> lance_core::Result<()> {
+    use prost::Message;
+    let vec = any
+        .downcast_ref::<Vec<IndexMetadata>>()
+        .expect("index_metadata_codec: wrong type (this is a bug in the cache layer)");
+    let section = pb::IndexSection {
+        indices: vec.iter().map(pb::IndexMetadata::from).collect(),
+    };
+    writer.write_all(&section.encode_to_vec())?;
+    Ok(())
+}
+
+fn deserialize_index_metadata(data: &bytes::Bytes) -> lance_core::Result<ArcAny> {
+    use prost::Message;
+    let section = pb::IndexSection::decode(data.as_ref())?;
+    let indices: Vec<IndexMetadata> = section
+        .indices
+        .into_iter()
+        .map(IndexMetadata::try_from)
+        .collect::<lance_core::Result<_>>()?;
+    Ok(Arc::new(indices))
+}
+
+pub fn index_metadata_codec() -> lance_core::cache::CacheCodec {
+    lance_core::cache::CacheCodec::new(serialize_index_metadata, deserialize_index_metadata)
+}
+
 /// List all files in an index directory with their sizes.
 ///
 /// Returns a list of `IndexFile` structs containing relative paths and sizes.

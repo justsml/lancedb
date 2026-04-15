@@ -15,6 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::Future;
 
+use super::CacheCodec;
 use crate::Result;
 
 /// A type-erased cache entry.
@@ -74,10 +75,16 @@ impl InternalCacheKey {
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Look up an entry by its key.
-    async fn get(&self, key: &InternalCacheKey) -> Option<CacheEntry>;
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry>;
 
     /// Store an entry. `size_bytes` is used for eviction accounting.
-    async fn insert(&self, key: &InternalCacheKey, entry: CacheEntry, size_bytes: usize);
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        codec: Option<CacheCodec>,
+    );
 
     /// Get an existing entry or compute it from `loader`.
     ///
@@ -90,6 +97,7 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         &self,
         key: &InternalCacheKey,
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+        codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
 
     /// Remove all entries whose prefix starts with the given string.
