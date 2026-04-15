@@ -215,9 +215,7 @@ impl BrowserTable {
             }
         };
 
-        rows.into_iter()
-            .map(|row| output_plan.materialize_row(&row))
-            .collect()
+        Ok(vec![output_plan.materialize_rows(&rows)?])
     }
 
     pub fn result_schema(&self, request: &SearchRequest) -> Result<ArrowSchema> {
@@ -295,9 +293,20 @@ impl BrowserTable {
                     distance_type,
                     ..
                 } => {
+                    // Skip rows with null vectors
+                    if let Some(vi) = vector_index {
+                        if batch.column(vi).is_null(row_index) {
+                            *ordinal += 1;
+                            continue;
+                        }
+                    }
                     let distance = vector_distance(
                         &batch,
-                        vector_index.expect("vector index present"),
+                        vector_index.ok_or_else(|| Error::Runtime {
+                            message:
+                                "vector search requires a vector column in the scan projection"
+                                    .to_string(),
+                        })?,
                         row_index,
                         query_vector,
                         *distance_type,
@@ -329,9 +338,20 @@ impl BrowserTable {
                     }
                 }
                 SearchMode::Hybrid(plan) => {
+                    // Skip rows with null vectors for the vector component
+                    if let Some(vi) = vector_index {
+                        if batch.column(vi).is_null(row_index) {
+                            *ordinal += 1;
+                            continue;
+                        }
+                    }
                     let distance = vector_distance(
                         &batch,
-                        vector_index.expect("vector index present"),
+                        vector_index.ok_or_else(|| Error::Runtime {
+                            message:
+                                "vector search requires a vector column in the scan projection"
+                                    .to_string(),
+                        })?,
                         row_index,
                         &plan.query_vector,
                         plan.distance_type,
@@ -840,6 +860,33 @@ impl OutputPlan {
             scan_projection,
             requires_scan_row_id,
         })
+    }
+
+    fn materialize_rows(&self, rows: &[ResultRow]) -> Result<RecordBatch> {
+        if rows.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(self.schema.clone())));
+        }
+        let columns: Vec<Arc<dyn Array>> = self
+            .items
+            .iter()
+            .map(|item| {
+                let arrays: Vec<Arc<dyn Array>> = rows
+                    .iter()
+                    .map(|row| {
+                        let scores = RowScores {
+                            distance: row.distance,
+                            text_score: row.text_score,
+                            relevance_score: row.relevance_score,
+                        };
+                        let context = RowContext::new(&row.batch, row.row_index, scores);
+                        item.materialize(&context, &row.batch, row.row_index)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+                arrow_select::concat::concat(&refs).map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(Arc::new(self.schema.clone()), columns).map_err(Error::from)
     }
 
     fn materialize_row(&self, row: &ResultRow) -> Result<RecordBatch> {

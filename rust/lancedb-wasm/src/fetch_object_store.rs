@@ -219,6 +219,10 @@ impl ObjectStore for FetchHttpStore {
         let store = self.clone();
         let location = location.clone();
         let (tx, rx) = oneshot::channel();
+        // `ObjectStore::get_opts` requires a `Send` future, but browser `fetch()`
+        // returns a non-Send JS `Promise`. We bridge the gap by spawning the fetch
+        // onto the local task queue (which doesn't require Send) and rendezvous
+        // through a oneshot channel whose receiver IS Send.
         spawn_local(async move {
             let result = store.fetch_parts(location, options).await;
             let _ = tx.send(result);
