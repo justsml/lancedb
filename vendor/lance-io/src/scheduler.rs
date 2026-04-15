@@ -12,8 +12,12 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tokio::sync::Notify;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
@@ -567,7 +571,9 @@ impl ScanScheduler {
         } else {
             #[cfg(target_arch = "wasm32")]
             {
-                panic!("The standard I/O scheduler is not supported on wasm32. Use with_lite_scheduler().");
+                panic!(
+                    "The standard I/O scheduler is not supported on wasm32. Use with_lite_scheduler()."
+                );
             }
             #[cfg(not(target_arch = "wasm32"))]
             {

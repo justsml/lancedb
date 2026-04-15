@@ -600,6 +600,38 @@ describe("@lancedb/lancedb-web/transformers", () => {
     expect(magnitude).toBeCloseTo(1.0);
   });
 
+  it("handles BigInt attention masks during mean pooling", async () => {
+    __setTransformersModuleLoaderForTests(async () => ({
+      AutoModel: {
+        from_pretrained: async () => ({
+          forward: async () => ({
+            last_hidden_state: {
+              dims: [1, 3, 2],
+              data: Float32Array.from([1, 2, 3, 4, 100, 100]),
+            },
+          }),
+        }),
+      },
+      AutoTokenizer: {
+        from_pretrained: async () =>
+          jest.fn(async () => ({
+            attention_mask: {
+              dims: [1, 3],
+              data: BigInt64Array.from([1n, 1n, 0n]),
+            },
+          })),
+      },
+    }));
+
+    const model = transformersEmbedder({
+      normalize: false,
+      pooling: "mean",
+    });
+    const { embedding } = await model.embed("test");
+
+    expect(embedding).toEqual([2, 3]);
+  });
+
   // -----------------------------------------------------------------------
   // #12 — error paths
   // -----------------------------------------------------------------------

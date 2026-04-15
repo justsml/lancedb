@@ -19,10 +19,12 @@
 pub mod backend;
 pub mod codec;
 mod moka;
+mod noop;
 
 pub use backend::{CacheBackend, CacheEntry, InternalCacheKey};
 pub use codec::{CacheCodec, CacheCodecImpl};
 pub use moka::MokaCacheBackend;
+pub use noop::NoopCacheBackend;
 
 use std::borrow::Cow;
 use std::sync::{
@@ -160,7 +162,7 @@ impl LanceCache {
 
     pub fn no_cache() -> Self {
         Self {
-            cache: Arc::new(MokaCacheBackend::no_cache()),
+            cache: Arc::new(NoopCacheBackend),
             prefix: Arc::from(""),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),

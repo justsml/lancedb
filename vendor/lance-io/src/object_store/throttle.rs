@@ -39,6 +39,11 @@ use rand::Rng;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
 ///
@@ -300,7 +305,7 @@ impl AimdThrottleConfig {
 
 struct TokenBucketState {
     tokens: f64,
-    last_refill: std::time::Instant,
+    last_refill: Instant,
     rate: f64,
 }
 
@@ -328,7 +333,7 @@ impl OperationThrottle {
             controller,
             bucket: Mutex::new(TokenBucketState {
                 tokens: burst_capacity,
-                last_refill: std::time::Instant::now(),
+                last_refill: Instant::now(),
                 rate: initial_rate,
             }),
             burst_capacity,
@@ -346,7 +351,7 @@ impl OperationThrottle {
     async fn acquire_token(&self) {
         let sleep_duration = {
             let mut bucket = self.bucket.lock().await;
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
             bucket.tokens = (bucket.tokens + elapsed * bucket.rate).min(self.burst_capacity);
             bucket.last_refill = now;

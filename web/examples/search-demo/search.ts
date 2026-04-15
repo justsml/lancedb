@@ -1,27 +1,65 @@
-import { searchTable } from "@lancedb/lancedb-web/transformers";
+import {
+  __setTransformersModuleLoaderForTests,
+  transformersEmbedder,
+} from "@lancedb/lancedb-web/transformers";
 
 const input = document.getElementById("search-input") as HTMLInputElement;
 const btn = document.getElementById("search-btn") as HTMLButtonElement;
 const statusEl = document.getElementById("status") as HTMLDivElement;
 const resultsEl = document.getElementById("results") as HTMLDivElement;
 
-const TABLE_URL = new URL("./search/site-index.lance", window.location.href).href;
+const SEARCH_INDEX_URL = new URL(
+  "./search/site-index.json",
+  window.location.href,
+).href;
 
-let table: Awaited<ReturnType<typeof searchTable>> | null = null;
+type SearchIndexRow = {
+  text: string;
+  page: string;
+  vector: number[];
+};
+
+type SearchIndex = {
+  metadata?: { embeddingModel?: string };
+  rows: SearchIndexRow[];
+};
+
+let model: ReturnType<typeof transformersEmbedder> | null = null;
+let rows: SearchIndexRow[] = [];
+
+// Parcel will not bundle the library's default indirect dynamic import.
+// Load the published browser bundle directly so Parcel does not try to
+// resolve the package's Node-only internals during development.
+__setTransformersModuleLoaderForTests(
+  async () => {
+    const specifier =
+      "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.min.js";
+    return await import(/* webpackIgnore: true */ /* @vite-ignore */ specifier);
+  },
+);
 
 async function init() {
   statusEl.textContent = "Loading search index & model...";
   try {
-    // Open the table first to read published metadata, then use the
-    // embedded model name to configure the embedding model.
-    const { openTable } = await import("@lancedb/lancedb-web");
-    const raw = await openTable(TABLE_URL);
-    const model = raw.metadata.embeddingModel;
-    if (!model) {
+    const response = await fetch(SEARCH_INDEX_URL);
+    if (!response.ok) {
+      throw new Error(
+        `Failed to load search index: ${response.status} ${response.statusText}`,
+      );
+    }
+    const searchIndex = (await response.json()) as SearchIndex;
+    const modelId = searchIndex.metadata?.embeddingModel;
+    if (!modelId) {
       throw new Error("No embeddingModel in table metadata");
     }
-    console.log(`Using embedding model: ${model}`);
-    table = await searchTable(TABLE_URL, model);
+    if (!Array.isArray(searchIndex.rows) || searchIndex.rows.length === 0) {
+      throw new Error("Search index did not contain any rows");
+    }
+
+    console.log(`Using embedding model: ${modelId}`);
+    rows = searchIndex.rows;
+    model = transformersEmbedder(modelId);
+    await model.preload?.();
     statusEl.textContent = "Ready to think.";
   } catch (e) {
     statusEl.textContent = `Failed to load: ${e}`;
@@ -30,7 +68,7 @@ async function init() {
 }
 
 async function doSearch() {
-  if (!table) return;
+  if (!model || rows.length === 0) return;
   const query = input.value.trim();
   if (!query) return;
 
@@ -39,7 +77,15 @@ async function doSearch() {
   resultsEl.innerHTML = "";
 
   try {
-    const results = await table.search({ text: query, limit: 5 });
+    const { embedding } = await model.embed(query);
+    const results = rows
+      .map((row) => ({
+        ...row,
+        score: dotProduct(embedding, row.vector),
+      }))
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 5);
+
     if (results.length === 0) {
       statusEl.textContent = "No results. Try harder.";
       return;
@@ -51,14 +97,14 @@ async function doSearch() {
       const card = document.createElement("div");
       card.className = "result-card";
 
-      const page = row.page as string;
-      const chunk = row.text as string;
-      const score = row._distance as number;
+      const page = row.page;
+      const chunk = row.text;
+      const score = row.score;
 
       card.innerHTML = `
         <h3><a href="${page}">${page}</a></h3>
         <p class="snippet">${chunk.slice(0, 200)}${chunk.length > 200 ? "..." : ""}</p>
-        <p class="score">distance: ${score.toFixed(4)}</p>
+        <p class="score">score: ${score.toFixed(4)}</p>
       `;
       resultsEl.appendChild(card);
     }
@@ -68,6 +114,15 @@ async function doSearch() {
   } finally {
     btn.disabled = false;
   }
+}
+
+function dotProduct(left: number[], right: number[]): number {
+  let total = 0;
+  const dimensions = Math.min(left.length, right.length);
+  for (let i = 0; i < dimensions; i += 1) {
+    total += left[i] * right[i];
+  }
+  return total;
 }
 
 btn.addEventListener("click", doSearch);

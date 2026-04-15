@@ -2,7 +2,7 @@
  * index-website.ts
  *
  * Quick-and-dirty indexer: reads the HTML pages in the parent directory,
- * strips tags to get text, chunks it, embeds with BAAI/bge-small-en-v1.5
+ * strips tags to get text, chunks it, embeds with Xenova/bge-small-en-v1.5
  * via @huggingface/transformers, and writes a Lance table to
  * ../search/site-index.lance.
  *
@@ -22,7 +22,7 @@ import { resolve, join } from "path";
 
 const PAGES_DIR = resolve(import.meta.dirname!, "..");
 const OUTPUT = resolve(PAGES_DIR, "search", "site-index.lance");
-const MODEL = "BAAI/bge-small-en-v1.5";
+const MODEL = "Xenova/bge-small-en-v1.5";
 const CHUNK_SIZE = 300; // characters per chunk (rough)
 
 /**
@@ -102,6 +102,9 @@ async function main() {
     embeddingModel: MODEL,
     ...parseManifestArgs(),
   };
+  const jsonIndexPath = join(searchDir, "site-index.json");
+  writeFileSync(jsonIndexPath, JSON.stringify({ metadata, rows }, null, 2));
+  console.log(`Wrote JSON search index to ${jsonIndexPath}`);
 
   // Patch metadata into the published sidecar files
   const tableDir = join(searchDir, "site-index.lance");

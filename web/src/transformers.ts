@@ -638,7 +638,7 @@ function meanPoolAt(
   const result = new Array<number>(hiddenSize).fill(0);
   let maskSum = 0;
   for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-    const weight = mask ? mask[tokenIndex] : 1;
+    const weight = mask ? Number(mask[tokenIndex]) : 1;
     if (weight === 0) continue;
     maskSum += weight;
     const offset = baseOffset + tokenIndex * hiddenSize;
