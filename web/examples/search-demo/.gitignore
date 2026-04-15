@@ -1,0 +1,7 @@
+.parcel-cache/
+search/
+dist/
+node_modules/
+.env
+.env.local
+bun.lock
